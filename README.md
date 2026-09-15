@@ -1,56 +1,55 @@
 # PaintR2
 
-Blender içinde **katmanlı texture painting** — ve sonucu gerçek doku
-dosyaları olarak dışa aktarma.
+**Layered texture painting inside Blender** — and the result exported as real
+texture files.
 
-Blender'ın Texture Paint'i aynı anda tek bir görüntünün üstüne boyar; katman
-yoktur. Katman mantığı ancak shader'da kurulabilir, o da dışa aktarılabilir
-bir dosya vermez. PaintR2 bu ikisini birleştiriyor: üst üste katmanlar boya,
-sonucu PNG/EXR olarak al.
+Blender's Texture Paint works on one image at a time; there are no layers. You
+can build layer logic in the shader, but a shader mix is not a file you can
+export. PaintR2 joins the two: paint in a stack of layers, take the result out
+as PNG or EXR.
 
-Substance Painter'ın yerine geçmek gibi bir iddiası yok. Amaç, Painter'a
-gitmeyi gerektirmeyecek kadar basit işleri Blender'da bitirmek.
-
----
-
-> ### ⚠️ Geliştirme aşamasında
->
-> PaintR2 **henüz geliştiriliyor** ve 1.0'a ulaşmadı (şu anki sürüm serisi
-> `0.10.x`). Şu an yapabildiği, **basit düzey** texture painting: katman yığını,
-> boyama, dolgu, maske ve kanal başına dışa aktarma. Karmaşık bir materyal
-> üretim hattının yerini tutmaz.
->
-> Pratikte bunun anlamı:
->
-> - **Ciddi bir işte tek başına güvenme.** Önemli dosyalarda önce bir kopya
->   üzerinde dene, sık kaydet.
-> - **Arayüz ve davranış değişebilir.** Sürümler arasında bazı şeyler yer
->   değiştirebilir.
-> - **Hatalar çıkabilir.** Karşılaşırsan
->   [issue aç](https://github.com/r2detta/PaintR2/issues) — ne yaptığını ve
->   Blender'ın konsolunda ne yazdığını eklersen çok yardımcı olur.
->
-> Neyin bilerek yapılmadığı aşağıda: [Bilinen sınırlar](#bilinen-sınırlar).
+It is not trying to replace Substance Painter. The goal is to finish the jobs
+simple enough that going to Painter for them was never worth the round trip.
 
 ---
 
-## Gereksinimler
+> ### ⚠️ Under development
+>
+> PaintR2 is **still being built** and has not reached 1.0 (the current series
+> is `0.10.x`). What it does today is **simple-level** texture painting: a layer
+> stack, painting, fills, masks, and per-channel export. It is not a substitute
+> for a full material pipeline.
+>
+> In practice that means:
+>
+> - **Don't rely on it alone for serious work.** Try it on a copy first, and
+>   save often.
+> - **The interface and behaviour can change** between versions.
+> - **You will probably hit bugs.** If you do, please
+>   [open an issue](https://github.com/r2detta/PaintR2/issues) — saying what you
+>   were doing and what Blender's console printed helps enormously.
+>
+> What is deliberately left out is below: [Known limits](#known-limits).
 
-- **Blender 5.2 LTS.** Yalnızca. Daha eski sürümlerde çalışmaz.
+---
 
-## Kurulum
+## Requirements
 
-**Hazır paketten (önerilen):**
-[Releases](https://github.com/r2detta/PaintR2/releases) sayfasından
-`PaintR2-<sürüm>.zip` dosyasını indir, Blender'da
-`Edit → Preferences → Add-ons → ▾ → Install from Disk` ile seç.
+- **Blender 5.2 LTS.** Only. It will not run on earlier versions.
 
-Yeşil **Code → Download ZIP** düğmesiyle inen dosya da aynı şekilde kurulur —
-Blender eklentinin kimliğini klasör adından değil manifest'ten okuyor. Tek
-farkı, o zip bake edicinin C++ kaynağını da taşıdığı için kurulum birkaç yüz
-kilobayt fazla yer kaplar. Releases'teki paket bundan arındırılmıştır.
+## Installation
 
-**Kaynaktan:** depoyu klonla ve eklenti klasörüne bağla:
+**From a release (recommended):** download `PaintR2-<version>.zip` from the
+[Releases](https://github.com/r2detta/PaintR2/releases) page, then in Blender
+pick `Edit → Preferences → Add-ons → ▾ → Install from Disk`.
+
+The green **Code → Download ZIP** button gives you a file that installs the same
+way — Blender takes the extension's identity from the manifest, not from the
+folder name. The only difference is that this zip also carries the baker's C++
+source, so the install takes a few hundred kilobytes more. The release package
+has that stripped out.
+
+**From source:** clone the repository and link it into your extensions folder:
 
 ```bash
 git clone https://github.com/r2detta/PaintR2.git
@@ -59,95 +58,98 @@ ln -s "$PWD/PaintR2" ~/.config/blender/5.2/extensions/user_default/PaintR2
 
 ---
 
-## Hızlı başlangıç
+## Quick start
 
-1. 3D görünümde boyayacağın mesh'i (ya da birkaçını) seç.
-2. `N` ile kenar çubuğunu aç, **PaintR2** sekmesine geç.
-3. Çözünürlüğü ve taban rengi seç, **Set Models**'a bas.
-   Objenin materyali yoksa `<obje>_Paint` diye bir tane kurulur; varsa
-   **adı korunarak yerinde sıfırlanır** — yani elindeki materyalin içeriği
-   gider, adı kalır.
-4. **Channels** panelinden bu materyalin hangi kanalları taşıyacağını seç
+1. In the 3D viewport, select the mesh (or meshes) you want to paint.
+2. Press `N` to open the sidebar and switch to the **PaintR2** tab.
+3. Choose a resolution and a base colour, then press **Set Models**.
+   An object with no material gets one called `<object>_Paint`; an object that
+   already has one **keeps the name but has the material reset in place** — so
+   whatever was in that material is gone, and only its name survives.
+4. In the **Channels** panel, pick which channels this material carries
    (Base Color, Roughness, Metallic, Normal, Height).
-5. **Open PaintR2**'ye bas. Katmanlar ve boyama ayrı bir pencerede açılır.
-6. İşin bitince o pencereden **Bake & Export**.
+5. Press **Open PaintR2**. Layers and painting open in a window of their own.
+6. When you are done, **Bake & Export** from that window.
 
-Kenar çubuğu yalnız hazırlık içindir; asıl iş PaintR2 penceresinde yapılır.
+The sidebar is only for setting up; the actual work happens in the PaintR2
+window.
 
 ---
 
-## Neler var
+## What's in it
 
-**Katmanlar**
-- Ekle, sil, sırala, gizle; sürükle-bırak ile taşıma
-- 19 karışım modu ve opaklık
-- **Gruplar** — iç içe, grubun maskesi ve opaklığı tüm alt ağaca işler
-- Katman maskeleri; maskeyi tek başına görüntüleme
-- Renk etiketleri, çoklu seçim, kopyala-yapıştır
-- Boya, dolgu, prosedürel, adjustment ve node katman tipleri
+**Layers**
+- Add, delete, reorder, hide; drag and drop to move
+- 19 blend modes and opacity
+- **Groups** — nested, with the group's mask and opacity applied to the whole
+  subtree
+- Layer masks, and viewing a mask on its own
+- Colour labels, multiple selection, copy and paste
+- Paint, fill, procedural, adjustment and node layer types
 
-**Boyama**
-- 3D görünümde, Blender'ın kendi fırça motoruyla (basınç, stroke yumuşatma dahil)
-- Fırça, darbe, falloff, imleç ve doku ayarlarının tamamı pencerenin içinde
-- Simetri: X / Y / Z ve ayna düzlemi
+**Painting**
+- In the 3D viewport, through Blender's own brush engine (pressure and stroke
+  smoothing included)
+- Every brush, stroke, falloff, cursor and texture setting, inside the window
+- Symmetry: X / Y / Z and a mirror plane
 
-**Dolgu araçları**
-- **Polygon Fill** — üçgen ya da poligon
-- **Mesh Fill** — bağlı parça ya da obje
-- **UV Island Fill** — UV adası
-- Kutu ve kement ile çoklu seçim, sürükleyerek doldurma, kenar yumuşatma ve taşma
-- Kendi geri alma halkası (`Ctrl Z`)
+**Fill tools**
+- **Polygon Fill** — triangle or polygon
+- **Mesh Fill** — connected part or whole object
+- **UV Island Fill** — one UV island
+- Box and lasso selection, drag to fill, edge softening and bleed
+- Its own undo ring (`Ctrl Z`)
 
-**Prosedürel ve düzenleme**
-- Gradient, Noise, Checker — hem katman hem maske olarak
-- Kendi node grubunu katman olarak kullanma
-- Adjustment katmanları: HSV, Levels, Bright/Contrast, Gamma, Invert
-- Katman başına efekt yığını
+**Procedural and adjustment**
+- Gradient, Noise, Checker — as a layer or as a mask
+- Use your own node group as a layer
+- Adjustment layers: HSV, Levels, Bright/Contrast, Gamma, Invert
+- A per-layer effect stack
 
-**PBR ve dışa aktarma**
-- Beş kanal: Base Color, Roughness, Metallic, Normal, Height
-- Kanal başına doğru renk uzayı ve bit derinliği; Normal ve Height 16 bit
-- Canlı Principled önizleme; ışıklandırma ve gölgeleme modları
-- Kanal başına ayrı dosya olarak dışa aktarma
+**PBR and export**
+- Five channels: Base Color, Roughness, Metallic, Normal, Height
+- The right colour space and bit depth per channel; Normal and Height at 16 bit
+- Live Principled preview, with lighting and shading modes
+- Exported as a separate file per channel
 
-**Mesh map bake**
+**Mesh map baking**
 - Ambient Occlusion, Curvature, Thickness, Position
-- High-poly'den Normal, Height ve Bent Normal
+- Normal, Height and Bent Normal from a high-poly
 
-**Çoklu obje ve materyal** — bir küme olarak boyanır ve birlikte dışa aktarılır.
+**Multiple objects and materials** — painted as one set, and exported together.
 
 ---
 
-## Kısayollar
+## Shortcuts
 
-Pencere içinde `F1` ya da `?` tam listeyi gösterir. Sık kullanılanlar:
+Press `F1` or `?` inside the window for the full list. The common ones:
 
-| Tuş | Ne yapar |
+| Key | What it does |
 |---|---|
-| `↑` `↓` | Üstteki / alttaki katmanı seç |
-| `Ctrl ↑` `Ctrl ↓` | Katmanı taşı |
-| `M` | Maskeyi kapat / aç |
-| `Shift M` | Maskeyi tek başına göster |
-| `I` | Katmanı tek başına göster |
-| `X` | Katmanı, maskesini ya da seçili filtreyi sil |
-| `Ctrl G` | Seçili katmanları grupla |
-| `Ctrl C` / `Ctrl V` | Katmanları kopyala / yapıştır |
-| `Ctrl Z` | Dolguyu geri al |
+| `↑` `↓` | Select the layer above / below |
+| `Ctrl ↑` `Ctrl ↓` | Move the layer |
+| `M` | Turn the mask off / back on |
+| `Shift M` | Show the mask on its own |
+| `I` | Show the layer on its own |
+| `X` | Delete the layer, its mask, or the selected filter |
+| `Ctrl G` | Group the selected layers |
+| `Ctrl C` / `Ctrl V` | Copy / paste layers |
+| `Ctrl Z` | Undo a fill |
 
 ---
 
-## Mesh map bake edici hakkında
+## About the mesh map baker
 
-Mesh map'ler için pakette hızlandırılmış bir bake edici var
-(`bin/paintr2_bake`) — şimdilik yalnızca **Linux x86-64** için derlenmiş.
+Mesh maps can go through an accelerated baker shipped with the add-on
+(`bin/paintr2_bake`), currently built for **Linux x86-64** only.
 
-Başka bir platformdaysan bir şey yapman gerekmiyor: eklenti bunu görüp
-sessizce **Cycles** yoluna geçer. Haritalar yine üretilir, sadece daha yavaş.
-Tek istisna **Bent Normal**: o harita yalnız hızlandırılmış bake edicide var
-ve Cycles yolunda üretilemez — atlandığı raporda söylenir.
+On any other platform there is nothing for you to do: the add-on notices and
+quietly falls back to **Cycles**. The maps are still produced, just more slowly.
+The one exception is **Bent Normal**, which only the accelerated baker can
+produce — on the Cycles path it is skipped, and the report says so.
 
-Bake edicinin kaynağı `PaintR2Bake/` altında, kendi `build.sh`'ıyla birlikte.
-Kendi platformun için derlemek istersen:
+The baker's source is under `PaintR2Bake/`, with its own `build.sh`. To build it
+for your platform:
 
 ```bash
 cd PaintR2Bake && ./build.sh
@@ -155,29 +157,29 @@ cd PaintR2Bake && ./build.sh
 
 ---
 
-## Bilinen sınırlar
+## Known limits
 
-**Bilerek çizilmiş sınırlar** — bunlar eksik değil, böyle tasarlandı:
+**Deliberate limits** — these are not missing features, they are decisions:
 
-- **Çözünürlük sonradan değişmez.** Set Models'ta seçilir ve öyle kalır.
-  Yeniden ölçeklemek her katmanı ve maskeyi yeniden örneklemek, yani geri
-  alınamaz bir kayıp olurdu. Yanlış başladıysan yol yeni bir materyal kurmak.
-- **Aynı anda tek PaintR2 penceresi** açılabilir.
-- **UDIM yok.** Tek UV karesi.
-- Smart material / smart mask yok.
+- **Resolution cannot be changed afterwards.** It is chosen in Set Models and
+  stays. Rescaling would mean resampling every layer and every mask, which is an
+  unrecoverable loss. If you started wrong, the way out is a new material.
+- **One PaintR2 window at a time.**
+- **No UDIM.** A single UV tile.
+- No smart materials or smart masks.
 
-**Henüz yapılmamış olanlar** — bir gün gelebilir, söz değil:
+**Not built yet** — these may come, but no promises:
 
-- Klon (clone) aracı.
-- Dolgu araçlarında düz renk yerine doku ile doldurma.
-- Katmanları renk etiketine göre süzme (etiketin kendisi var, süzme yok).
-- Arayüz ikonlarının çoğu hâlâ çizim; yalnız ikisi dosyadan geliyor.
+- A clone tool.
+- Filling with a texture rather than a flat colour.
+- Filtering layers by colour label (the labels exist; the filtering does not).
+- Most interface icons are still drawn in code; only two come from files.
 
 ---
 
-## Lisans
+## Licence
 
-GPL-3.0-or-later. Tam metin [LICENSE](LICENSE) dosyasında.
+GPL-3.0-or-later. Full text in [LICENSE](LICENSE).
 
-`PaintR2Bake/third_party/tiny_bvh.h` MIT lisanslıdır; telif ve izin notu
-dosyanın kendi başlığındadır.
+`PaintR2Bake/third_party/tiny_bvh.h` is MIT licensed; its copyright and
+permission notice are in the file's own header.

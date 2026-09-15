@@ -1,24 +1,27 @@
-# İkon klasörü
+# Icon folder
 
-PaintR2'nin arayüz ikonlarını kendi çizdiklerinle değiştirebilirsin.
+You can replace PaintR2's interface icons with your own.
 
-Buraya konan bir PNG, o ikonun yerine geçer. Dosya yoksa eklentinin kendi
-çizimi kullanılır — yani **seti parça parça değiştirebilirsin**, eksik dosya
-hata değildir. İki ikonluk bir klasör de çalışan bir klasördür.
+A PNG dropped in here takes the place of that icon. If the file is not there,
+the add-on's own drawing is used instead — so you can **replace the set a piece
+at a time**, and a missing file is not an error. A folder with two icons in it
+is a working folder.
 
 ## Format
 
-- **PNG, RGBA.** `.ico` kullanılamaz — Blender o uzantıyı tanımıyor.
-- **64x64**, ikon başına tek dosya. Ölçek varyantı tutulmuyor.
-- **Beyaz siluet + saydamlık.** Renk çizim sırasında veriliyor; üzerine
-  gelince, soluk ve vurgulu hallerin hepsi aynı dosyadan çıkıyor. Renkli bir
-  dosya koyarsan o ikon tonlanamaz, hep aynı renkte kalır.
-- Kenarda biraz boşluk bırak: mark 64 piksellik karenin kenarından ~4-8 piksel
-  içeride dursun.
+- **PNG, RGBA.** `.ico` will not work — Blender does not recognise that
+  extension.
+- **64x64**, one file per icon. No scale variants are kept.
+- **White silhouette plus transparency.** The colour is applied at draw time, so
+  the hover, dimmed and highlighted states all come out of the same file. If you
+  put a coloured file in, that icon cannot be tinted and will always stay the
+  colour it is.
+- Leave a little margin: keep the mark roughly 4–8 pixels in from the edge of
+  the 64-pixel square.
 
-## Dosya adları
+## File names
 
-Dosyanın adı, değiştirdiği ikonun adıdır. Geçerli adların tamamı:
+A file's name is the name of the icon it replaces. The full list of valid names:
 
 ```
 adjustment     arrow_down     arrow_up       brush          check
@@ -29,26 +32,26 @@ plus           polygon_fill   pressure       select_box     select_lasso
 stroke         swap           trash          uv_island_fill wireframe
 ```
 
-Hiçbirine uymayan bir PNG sessizce yok sayılır.
+A PNG matching none of these is ignored.
 
-## Kendi klasörünü kullanmak
+## Using your own folder
 
-Eklentiyi güncellediğinde dosyaların silinmesin diye, ikonlarını paketin
-dışında bir klasörde tutabilirsin:
+So your files are not wiped when you update the add-on, you can keep your icons
+in a folder outside the package:
 
 `Edit → Preferences → Add-ons → PaintR2 → Icon Folder`
 
-Orayı gösterdiğinde ikonlar önce senin klasöründen okunur; bir ad için orada
-dosya yoksa paketinki, o da yoksa çizim kullanılır.
+Point that at your folder and icons are read from there first; for any name with
+no file there, the packaged one is used, and failing that the drawing.
 
-## Değiştirdikten sonra
+## After changing a file
 
-PaintR2 penceresini kapat-aç, yeter. Blender'ı yeniden başlatman gerekmiyor.
+Close and reopen the PaintR2 window. There is no need to restart Blender.
 
-## Şu an bu klasörde olanlar
+## What is in this folder today
 
 ```
 brush.png   fill_bucket.png
 ```
 
-Kalan ikonlar eklentinin kendi çizimlerinden geliyor.
+Every other icon comes from the add-on's own drawings.
