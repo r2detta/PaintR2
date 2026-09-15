@@ -1,0 +1,37 @@
+schema_version = "1.0.0"
+
+# NOTE: `id` must match the extension directory name exactly. If you rename the
+# folder, rename this too, otherwise Blender rejects the extension on refresh.
+id = "PaintR2"
+version = "0.10.35"
+name = "PaintR2"
+tagline = "Layer-based texture painting with exportable output"
+maintainer = "r2detta"
+type = "add-on"
+
+website = "https://github.com/r2detta/PaintR2"
+
+blender_version_min = "5.2.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+copyright = [
+  "2026 r2detta",
+]
+
+tags = ["Paint", "Material", "UV"]
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  "/.git/",
+  "/.github/",
+  "/.gitignore",
+  "/*.zip",
+  "/.DS_Store",
+  # The mesh map baker's C++ source. The built binary ships in `bin/`; the
+  # source is in the repository, which is what the licence asks for. An
+  # installed add-on has no use for it.
+  "/PaintR2Bake/",
+]
