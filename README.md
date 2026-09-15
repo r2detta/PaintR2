@@ -168,12 +168,6 @@ cd PaintR2Bake && ./build.sh
 - **No UDIM.** A single UV tile.
 - No smart materials or smart masks.
 
-**Not built yet** — these may come, but no promises:
-
-- A clone tool.
-- Filling with a texture rather than a flat colour.
-- Filtering layers by colour label (the labels exist; the filtering does not).
-- Most interface icons are still drawn in code; only two come from files.
 
 ---
 
