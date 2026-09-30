@@ -177,6 +177,8 @@ class PAINTR2_PT_meshmaps(bpy.types.Panel):
 
         layout.prop(props, "mesh_map_resolution")
         layout.prop(props, "mesh_map_backend", text="")
+        layout.prop(props, "bake_models")
+        layout.prop(props, "bake_occluders")
 
         column = layout.column(align=True)
         for identifier in meshmaps.MAP_IDS:
@@ -242,10 +244,8 @@ class PAINTR2_PT_meshmaps(bpy.types.Panel):
         elif not obj.data.uv_layers:
             layout.label(text="No UV map - unwrap first", icon='ERROR')
 
-        count = len([
-            o for o in context.selected_objects
-            if o is not None and o.type == 'MESH'
-        ])
+        from ..ops import op_meshmaps
+        count = len(op_meshmaps.bake_targets(context))
         if props.mesh_map_backend == 'EXTERNAL' and binary is None:
             layout.label(text="External baker not installed", icon='ERROR')
 

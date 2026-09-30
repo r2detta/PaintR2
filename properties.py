@@ -585,6 +585,39 @@ class PR2_SceneProps(PropertyGroup):
         default='AUTO',
     )
 
+    # Two separate questions, and they were one hidden answer each before:
+    # which models get maps, and which models a map can see.
+    bake_models: EnumProperty(
+        name="Bake",
+        description="Which models get mesh maps",
+        items=(
+            ('ALL', "All Models",
+             "Every model in the paint set, one after another"),
+            ('ACTIVE', "Active Model",
+             "Only the model being worked on. The others keep the maps they "
+             "have"),
+        ),
+        default='ALL',
+    )
+
+    bake_occluders: EnumProperty(
+        name="Occlusion",
+        description="What may shadow a model's Ambient Occlusion and Bent "
+        "Normal. Thickness always reads the model alone, and nothing outside "
+        "the paint set ever takes part",
+        items=(
+            ('SELF', "Self Only",
+             "Each model is shadowed only by itself, as if it were alone in "
+             "the scene. The map stays right if the models are moved apart "
+             "later"),
+            ('MODELS', "All Models",
+             "The other models in the paint set shadow it too -- where a hand "
+             "rests on an arm, the arm darkens. With Highpoly Bake a model's "
+             "high-poly stands in for it"),
+        ),
+        default='SELF',
+    )
+
     mesh_map_samples: IntProperty(
         name="Samples",
         description="Rays per texel for AO and Thickness, and the only thing "
@@ -684,7 +717,7 @@ class PR2_SceneProps(PropertyGroup):
         default=False,
     )
 
-    # --- ambient occlusion, the way a baker asks about it --------------------
+    # --- ambient occlusion, the way a bake edicisi asks about it ------------
     # Substance Painter's AO panel, minus the ones this tracer has no answer
     # for. Every one of these is a real change to how the rays are fired or
     # counted, and every one of them is measured in the test suite.

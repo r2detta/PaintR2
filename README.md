@@ -115,6 +115,8 @@ window.
 **Mesh map baking**
 - Ambient Occlusion, Curvature, Thickness, Position
 - Normal, Height and Bent Normal from a high-poly
+- Bake every model or only the active one; choose whether the other models
+  shadow a model's Ambient Occlusion or it is baked as if alone
 
 **Multiple objects and materials** — painted as one set, and exported together.
 

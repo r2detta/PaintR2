@@ -2308,6 +2308,10 @@ def _map_rows(context):
     rows = [
         _row('scene', "mesh_map_resolution", label="Size", context=context),
         _row('scene', "mesh_map_backend", label="Baker", context=context),
+        # The two questions a bake of more than one model has to answer:
+        # which of them get maps, and whether they shadow one another.
+        _row('scene', "bake_models", label="Bake", context=context),
+        _row('scene', "bake_occluders", label="Occlusion", context=context),
         _separator(),
     ]
 
@@ -2355,6 +2359,11 @@ def _map_rows(context):
             "label": "Ambient Occlusion",
             "open": False,
             "rows": _compact([
+                # The one AO setting both bakers read, so it sits above the
+                # "External baker only" note. Same property as the Samples row
+                # under the panels, which Thickness shares.
+                _row('scene', "mesh_map_samples", label="Samples",
+                     context=context),
                 None if use_external else {
                     "kind": 'label',
                     "label": "External baker only",
@@ -2434,17 +2443,16 @@ def _map_rows(context):
     if problem:
         rows.append({"kind": 'label', "label": problem, "active": False})
 
-    models = [
-        o for o in context.selected_objects if o is not None and o.type == 'MESH'
-    ]
-    if not models and obj is not None and obj.type == 'MESH':
-        models = [obj]
+    # Counted by the operator's own rule, so the button cannot promise a
+    # different number of models than the bake then makes.
+    from .ops import op_meshmaps
+    models = op_meshmaps.bake_targets(context)
 
     rows.append({
         "kind": 'button',
         "label": "Bake Mesh Maps" if len(models) <= 1
         else f"Bake {len(models)} Models",
-        "desc": "Bake the ticked maps for the selected models",
+        "desc": "Bake the ticked maps for the models the Bake row names",
         "action": ('bake_maps',),
         "active": not problem,
     })

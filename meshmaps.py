@@ -61,6 +61,7 @@ silent failures:
   independent of lighting, which is what a data bake wants.
 """
 
+import contextlib
 import math
 
 import bmesh
@@ -935,6 +936,65 @@ def _bake_into(obj, image, bake_type, margin, ao_distance=None, attribute=None,
         context.view_layer.objects.active = active
 
 
+# --- what the rays can see ---------------------------------------------------
+
+
+# The maps other models may shadow. Thickness is left out on purpose: it is
+# how deep *this* shape is, and a neighbour pressed against it would read as
+# the model being thick where it is not. Everything else is either not traced
+# (Curvature, Position) or traced selected-to-active, where Cycles only ever
+# hits the selected high-poly.
+OCCLUDED_MAPS = frozenset({'AO', 'BENT_NORMAL'})
+
+
+def occluders_for(obj, models, high_of=None):
+    """What shadows `obj`'s AO besides itself: every other model, as the
+    surface that stands for it.
+
+    `high_of(model)` returns a model's high-poly or None. With a high-poly
+    bake the high-poly *is* the shape -- it is what `obj`'s own AO is read
+    off -- so a neighbour is represented by its high-poly too, and by its
+    low-poly only when it has none. Both at once would shadow twice.
+    """
+    out = []
+    for model in models:
+        if model is None or model == obj:
+            continue
+        partner = high_of(model) if high_of is not None else None
+        out.append(partner if partner is not None else model)
+    return out
+
+
+@contextlib.contextmanager
+def render_only(keep):
+    """Take every object but `keep` out of the bake for the duration.
+
+    **`hide_render`, and not `hide_set`, and this was measured:** a cube
+    hidden in the viewport over a plane still darkened the plane's AO bake to
+    0.337; with `hide_render` it came back 1.0. A Cycles bake traces whatever
+    would render, so viewport hiding -- including the session's isolation --
+    decides nothing about what shadows a map. Without this, *every* visible
+    object in the file was an occluder, whatever the settings said.
+
+    Only objects this switches off are switched back on, so one the user had
+    already excluded from rendering stays excluded.
+    """
+    names = {o.name for o in keep if o is not None}
+    switched = []
+    for scene_object in bpy.context.scene.objects:
+        if scene_object.name in names or scene_object.hide_render:
+            continue
+        scene_object.hide_render = True
+        switched.append(scene_object.name)
+    try:
+        yield
+    finally:
+        for name in switched:
+            scene_object = bpy.data.objects.get(name)
+            if scene_object is not None:
+                scene_object.hide_render = False
+
+
 # --- the four maps -----------------------------------------------------------
 
 
@@ -1181,8 +1241,12 @@ def _read(image):
 
 
 def bake_maps(obj, identifiers, size=1024, margin=8, smooth=1,
-              high=None, options=None):
+              high=None, options=None, occluders=()):
     """Bake the named maps for `obj`. Returns a MapResult.
+
+    `occluders` are the other objects allowed to shadow AO -- `occluders_for`
+    builds them. Nothing else in the scene takes part in any bake here: every
+    other object is out of the render for the duration (`render_only`).
 
     `high` is the high-poly to read from, or None for the self-bake this
     module has always done. It is the caller's job to find it -- `paintset.py`
@@ -1228,19 +1292,14 @@ def bake_maps(obj, identifiers, size=1024, margin=8, smooth=1,
             map_name(obj, identifier), size, entry[2], float_buffer=entry[4]
         )
 
+        participants = [obj, high]
+        if identifier in OCCLUDED_MAPS:
+            participants.extend(occluders)
+
         try:
-            if identifier == 'AO':
-                _bake_ao(obj, image, margin, high, options)
-            elif identifier == 'POSITION':
-                _bake_position(obj, image, margin, high, options)
-            elif identifier == 'THICKNESS':
-                _bake_thickness(obj, image, margin, reach, high, options)
-            elif identifier == 'CURVATURE':
-                _bake_curvature(obj, image, margin, smooth, high, options)
-            elif identifier == 'NORMAL':
-                _bake_normal(obj, image, margin, high, options)
-            elif identifier == 'HEIGHT':
-                _bake_height(obj, image, margin, high, options)
+            with render_only(participants):
+                _bake_one(identifier, obj, image, margin, reach, smooth, high,
+                          options)
         except Exception as error:  # noqa: BLE001
             result.error = error
             return result
@@ -1256,6 +1315,22 @@ def bake_maps(obj, identifiers, size=1024, margin=8, smooth=1,
         _store(obj, identifier, image)
 
     return result
+
+
+def _bake_one(identifier, obj, image, margin, reach, smooth, high, options):
+    """Dispatch one map to the function that bakes it. Raises on failure."""
+    if identifier == 'AO':
+        _bake_ao(obj, image, margin, high, options)
+    elif identifier == 'POSITION':
+        _bake_position(obj, image, margin, high, options)
+    elif identifier == 'THICKNESS':
+        _bake_thickness(obj, image, margin, reach, high, options)
+    elif identifier == 'CURVATURE':
+        _bake_curvature(obj, image, margin, smooth, high, options)
+    elif identifier == 'NORMAL':
+        _bake_normal(obj, image, margin, high, options)
+    elif identifier == 'HEIGHT':
+        _bake_height(obj, image, margin, high, options)
 
 
 def _store(obj, identifier, image):

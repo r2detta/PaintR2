@@ -12,7 +12,7 @@ namespace pr2 {
 
 constexpr char kInputMagic[8] = {'P', 'R', '2', 'B', 'A', 'K', 'E', '1'};
 constexpr char kOutputMagic[8] = {'P', 'R', '2', 'M', 'A', 'P', 'S', '1'};
-constexpr uint32_t kVersion = 3;
+constexpr uint32_t kVersion = 4;
 
 // One bit per map, so a single run can produce several off one rasterization.
 // That sharing is the point: in Cycles every map pays for its own bake.
@@ -80,6 +80,14 @@ struct Header {
     uint32_t low_tris;    // low-poly triangle soup, 8 floats per corner
     uint32_t high_verts;  // 0 means "bake the low-poly against itself"
     uint32_t high_tris;
+    // Other models, for ambient occlusion and the bent normal only. Positions
+    // and indices, no normals: nothing is shaded off them, they only stop
+    // rays. Kept out of the BVH the projection and thickness rays use -- a
+    // cage ray that lands on the model next door writes the neighbour's
+    // surface into this model's normal map, and a thickness probe that finds
+    // it calls the model thick where it is not.
+    uint32_t occluder_verts;
+    uint32_t occluder_tris;
 };
 
 struct OutputHeader {

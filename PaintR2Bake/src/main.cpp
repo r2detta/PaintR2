@@ -108,8 +108,13 @@ struct Scene {
     std::vector<float> high_pos;   // high_verts * 3
     std::vector<float> high_nrm;   // high_verts * 3
     std::vector<uint32_t> high_idx;
+    std::vector<float> occ_pos;    // occluder_verts * 3
+    std::vector<uint32_t> occ_idx; // occluder_tris * 3
 
     bool has_high() const { return header.high_verts > 0 && header.high_tris > 0; }
+    bool has_occluders() const {
+        return header.occluder_verts > 0 && header.occluder_tris > 0;
+    }
 };
 
 bool read_all(std::FILE* file, void* into, size_t bytes) {
@@ -156,6 +161,22 @@ bool load(const char* path, Scene& scene, std::string& error) {
              read_all(file, scene.high_nrm.data(), verts * 3 * sizeof(float)) &&
              read_all(file, scene.high_idx.data(), tris * 3 * sizeof(uint32_t));
         if (!ok) error = "input ends inside the high-poly";
+    }
+
+    if (ok && scene.has_occluders()) {
+        const size_t verts = scene.header.occluder_verts;
+        const size_t tris = scene.header.occluder_tris;
+        scene.occ_pos.resize(verts * 3);
+        scene.occ_idx.resize(tris * 3);
+        ok = read_all(file, scene.occ_pos.data(), verts * 3 * sizeof(float)) &&
+             read_all(file, scene.occ_idx.data(), tris * 3 * sizeof(uint32_t));
+        if (!ok) error = "input ends inside the occluders";
+        for (size_t i = 0; ok && i < scene.occ_idx.size(); ++i) {
+            if (scene.occ_idx[i] >= verts) {
+                error = "occluder index out of range";
+                ok = false;
+            }
+        }
     }
 
     std::fclose(file);
@@ -915,7 +936,10 @@ bool trace_gpu(gpu::Device& device, const BVH_GPU& bvh, const Scene& scene,
                const Reach& reach, const AOOptions& ao,
                const CurvatureRange& curvature_range, Vec3 bbox_lo,
                Vec3 bbox_span, float extrusion, float ray_distance,
-               float height_range, float curvature_scale, Maps& maps,
+               float height_range, float curvature_scale,
+               const BVH_GPU* occlusion,
+               const std::vector<bvhvec4>& occ_vertices,
+               const std::vector<uint32_t>& occ_indices, Maps& maps,
                std::string& error) {
     const size_t texels = size_t(gbuffer.size) * gbuffer.size;
     const size_t out_bytes = texels * 4 * sizeof(float);
@@ -1049,33 +1073,70 @@ bool trace_gpu(gpu::Device& device, const BVH_GPU& bvh, const Scene& scene,
         if (want & pr2::kMapThickness) kernel_want |= 2u;
         if (want & pr2::kMapBentNormal) kernel_want |= 4u;
 
-        if (!device.prepare("trace", error)) return false;
-        device.arg_buffer(0, slot_nodes);
-        device.arg_buffer(1, slot_order);
-        device.arg_buffer(2, slot_tris);
-        device.arg_buffer(3, slot_verts);
-        device.arg_buffer(4, slot_pos);
-        device.arg_buffer(5, slot_proj_pos);
-        device.arg_buffer(6, slot_proj_nrm);
-        device.arg_buffer(7, slot_ao);
-        device.arg_buffer(8, slot_thick);
-        device.arg_buffer(9, slot_bent);
-        device.arg_uint(11, uint32_t(texels));
-        device.arg_uint(12, samples);
-        device.arg_uint(13, kernel_want);
-        device.arg_float(14, reach.epsilon);
-        device.arg_float(15, reach.ao);
-        device.arg_float(16, reach.thickness);
-        device.arg_float(17, ao.cos_max);
-        device.arg_float(18, ao.min_distance);
-        device.arg_uint(19, ao.attenuation);
-        device.arg_uint(20, ao.flags());
-        for (size_t first = 0; first < texels; first += band) {
-            device.arg_uint(10, uint32_t(first));
-            if (!device.launch(std::min(band, texels - first), error)) return false;
-            std::printf("PROGRESS %.3f\n",
-                        float(first + band) / float(texels) * 0.95f);
-            std::fflush(stdout);
+        // One launch per mesh the rays have to see. Thickness is a fact about
+        // this model alone; AO and the bent normal, with occluders, are traced
+        // against this model *and* its neighbours -- a second BVH, uploaded
+        // only when there is one, so a bake without neighbours pays nothing.
+        struct Pass {
+            uint32_t want;
+            int nodes, order, tris, verts;
+        };
+        std::vector<Pass> passes;
+        if (occlusion != nullptr && (kernel_want & 5u)) {
+            if (kernel_want & 2u) {
+                passes.push_back({2u, slot_nodes, slot_order, slot_tris, slot_verts});
+            }
+            const int occ_nodes = device.upload(
+                occlusion->bvhNode,
+                size_t(occlusion->usedNodes) * sizeof(BVH_GPU::BVHNode), error);
+            const int occ_order = device.upload(
+                occlusion->bvh.primIdx,
+                size_t(occlusion->bvh.idxCount) * sizeof(uint32_t), error);
+            const int occ_tris = device.upload(
+                occ_indices.data(), occ_indices.size() * sizeof(uint32_t), error);
+            const int occ_verts = device.upload(
+                occ_vertices.data(), occ_vertices.size() * sizeof(bvhvec4), error);
+            if (occ_nodes < 0 || occ_order < 0 || occ_tris < 0 || occ_verts < 0) {
+                return false;
+            }
+            passes.push_back({kernel_want & 5u, occ_nodes, occ_order, occ_tris,
+                              occ_verts});
+        } else {
+            passes.push_back({kernel_want, slot_nodes, slot_order, slot_tris,
+                              slot_verts});
+        }
+
+        for (size_t p = 0; p < passes.size(); ++p) {
+            const Pass& pass = passes[p];
+            if (!device.prepare("trace", error)) return false;
+            device.arg_buffer(0, pass.nodes);
+            device.arg_buffer(1, pass.order);
+            device.arg_buffer(2, pass.tris);
+            device.arg_buffer(3, pass.verts);
+            device.arg_buffer(4, slot_pos);
+            device.arg_buffer(5, slot_proj_pos);
+            device.arg_buffer(6, slot_proj_nrm);
+            device.arg_buffer(7, slot_ao);
+            device.arg_buffer(8, slot_thick);
+            device.arg_buffer(9, slot_bent);
+            device.arg_uint(11, uint32_t(texels));
+            device.arg_uint(12, samples);
+            device.arg_uint(13, pass.want);
+            device.arg_float(14, reach.epsilon);
+            device.arg_float(15, reach.ao);
+            device.arg_float(16, reach.thickness);
+            device.arg_float(17, ao.cos_max);
+            device.arg_float(18, ao.min_distance);
+            device.arg_uint(19, ao.attenuation);
+            device.arg_uint(20, ao.flags());
+            for (size_t first = 0; first < texels; first += band) {
+                device.arg_uint(10, uint32_t(first));
+                if (!device.launch(std::min(band, texels - first), error)) return false;
+                const float done = (float(p) + float(first + band) / float(texels)) /
+                                   float(passes.size());
+                std::printf("PROGRESS %.3f\n", std::fmin(done, 1.0f) * 0.95f);
+                std::fflush(stdout);
+            }
         }
     }
 
@@ -1214,6 +1275,37 @@ int main(int argc, char** argv) {
 
     const uint32_t triangles = uint32_t(indices.size() / 3);
 
+    // --- the mesh an AO ray is stopped by ---
+    //
+    // This model's own traced mesh plus its neighbours, as one indexed mesh
+    // with the neighbours' indices shifted past this model's vertices. Built
+    // only when there are neighbours *and* a map that reads them; every other
+    // map keeps tracing the mesh above and nothing else.
+    const bool occluded_by_others =
+        scene.has_occluders() && (want & (pr2::kMapAO | pr2::kMapBentNormal));
+    std::vector<bvhvec4> occ_vertices;
+    std::vector<uint32_t> occ_indices;
+    if (occluded_by_others) {
+        const uint32_t base = uint32_t(vertices.size());
+        occ_vertices = vertices;
+        occ_vertices.reserve(vertices.size() + scene.header.occluder_verts);
+        for (size_t v = 0; v < scene.header.occluder_verts; ++v) {
+            occ_vertices.emplace_back(scene.occ_pos[v * 3 + 0],
+                                      scene.occ_pos[v * 3 + 1],
+                                      scene.occ_pos[v * 3 + 2], 0.0f);
+        }
+        occ_indices = indices;
+        occ_indices.reserve(indices.size() + scene.occ_idx.size());
+        for (uint32_t index : scene.occ_idx) occ_indices.push_back(base + index);
+    }
+    std::vector<float>().swap(scene.occ_pos);
+    std::vector<uint32_t>().swap(scene.occ_idx);
+    const uint32_t occ_triangles = uint32_t(occ_indices.size() / 3);
+    if (occluded_by_others) {
+        std::printf("STATS occluders %u\n", scene.header.occluder_tris);
+        std::fflush(stdout);
+    }
+
     GBuffer gbuffer;
     rasterize(scene, gbuffer);
     // Read into the gbuffer and not needed again. Freeing it here is what
@@ -1326,10 +1418,17 @@ int main(int argc, char** argv) {
             ray_distance = std::fmax(extrusion * 2.0f, diagonal * 0.05f);
         }
 
+        BVH_GPU occ_bvh;
+        if (occluded_by_others) {
+            occ_bvh.Build(occ_vertices.data(), occ_indices.data(), occ_triangles);
+        }
+
         if (!trace_gpu(device, bvh, scene, vertices, indices, gbuffer, samples,
                        want, flip_green, reach, ao, curvature_range, bbox_lo,
                        bbox_span, extrusion, ray_distance, height_range,
-                       curvature_scale, maps, error)) {
+                       curvature_scale,
+                       occluded_by_others ? &occ_bvh : nullptr, occ_vertices,
+                       occ_indices, maps, error)) {
             std::printf("ERROR %s\n", error.c_str());
             return 1;
         }
@@ -1362,8 +1461,23 @@ int main(int argc, char** argv) {
             std::printf("STATS projected %zu/%zu\n", hits, covered);
             std::fflush(stdout);
         }
-        trace_cpu(bvh, gbuffer, projection, samples, want, reach, ao,
-                  indices, vertices.data(), maps);
+        if (occluded_by_others) {
+            // Thickness against this model alone, AO and bent normal against
+            // it and its neighbours -- see `occluded_by_others`.
+            const uint32_t own = want & pr2::kMapThickness;
+            if (own) {
+                trace_cpu(bvh, gbuffer, projection, samples, own, reach, ao,
+                          indices, vertices.data(), maps);
+            }
+            BVH8_CPU occ_bvh;
+            occ_bvh.Build(occ_vertices.data(), occ_indices.data(), occ_triangles);
+            trace_cpu(occ_bvh, gbuffer, projection, samples,
+                      want & (pr2::kMapAO | pr2::kMapBentNormal), reach, ao,
+                      occ_indices, occ_vertices.data(), maps);
+        } else {
+            trace_cpu(bvh, gbuffer, projection, samples, want, reach, ao,
+                      indices, vertices.data(), maps);
+        }
         surface_cpu(gbuffer, projection, want, flip_green, bbox_lo, bbox_span,
                     height_range, maps);
         if (want & pr2::kMapCurvature) {

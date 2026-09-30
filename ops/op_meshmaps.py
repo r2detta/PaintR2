@@ -55,6 +55,42 @@ def _selected_meshes(context):
     return []
 
 
+def bake_targets(context):
+    """The models a bake produces maps for: all of them, or the active one.
+
+    Same rule as the export's "Active Model Only": the active object when it
+    is one of the models, otherwise the first -- a bake that was asked for one
+    model makes one, rather than none because the click last landed on a lamp.
+    """
+    models = _selected_meshes(context)
+    props = context.scene.paintr2
+    if props.bake_models != 'ACTIVE' or not models:
+        return models
+
+    active = context.active_object
+    return [active] if active in models else models[:1]
+
+
+def occluders(context, obj):
+    """The other models that may shadow `obj`'s AO. Empty for Self Only.
+
+    Drawn from every model, not from `bake_targets`: baking only the active
+    model is a choice about which maps to *make*, and has nothing to say
+    about what those maps see.
+    """
+    props = context.scene.paintr2
+    if props.bake_occluders != 'MODELS':
+        return []
+
+    high_of = None
+    if props.use_highpoly_bake:
+        def high_of(model):
+            partner = paintset.find_high(model, props.highpoly_suffix)
+            return partner.object if partner else None
+
+    return meshmaps.occluders_for(obj, _selected_meshes(context), high_of)
+
+
 def _dropped_note(names):
     """The front of a report for models that came out of a bake with no map.
 
@@ -185,7 +221,8 @@ class PAINTR2_OT_bake_mesh_maps_external(bpy.types.Operator):
             try:
                 path = ext.prepare(
                     obj, high, self._directory, int(props.mesh_map_resolution),
-                    props.mesh_map_samples, wanted, options)
+                    props.mesh_map_samples, wanted, options,
+                    occluders=occluders(context, obj))
             except Exception as error:  # noqa: BLE001
                 self._skipped.append(f"{obj.name}: {error}")
                 self._dropped.append(obj.name)
@@ -215,7 +252,7 @@ class PAINTR2_OT_bake_mesh_maps_external(bpy.types.Operator):
         self._directory = tempfile.mkdtemp(prefix="paintr2_bake_")
 
         self._queue = []
-        for obj in _selected_meshes(context):
+        for obj in bake_targets(context):
             high = None
             if props.use_highpoly_bake:
                 partner = paintset.find_high(obj, props.highpoly_suffix)
@@ -290,7 +327,7 @@ class PAINTR2_OT_bake_mesh_maps_external(bpy.types.Operator):
         props = context.scene.paintr2
 
         self._queue = []
-        for obj in _selected_meshes(context):
+        for obj in bake_targets(context):
             high = None
             if props.use_highpoly_bake:
                 partner = paintset.find_high(obj, props.highpoly_suffix)
@@ -368,7 +405,7 @@ class PAINTR2_OT_bake_mesh_maps(bpy.types.Operator):
 
     def execute(self, context):
         props = context.scene.paintr2
-        objects = _selected_meshes(context)
+        objects = bake_targets(context)
 
         wanted = [
             identifier for identifier in meshmaps.MAP_IDS
@@ -409,6 +446,7 @@ class PAINTR2_OT_bake_mesh_maps(bpy.types.Operator):
                     smooth=props.curvature_smooth,
                     high=high,
                     options=options,
+                    occluders=occluders(context, obj),
                 )
 
                 if result.error is not None:

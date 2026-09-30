@@ -68,11 +68,11 @@ ATTENUATION = {'NONE': 0.0, 'LINEAR': 1.0, 'SMOOTH': 2.0}
 
 INPUT_MAGIC = b"PR2BAKE1"
 OUTPUT_MAGIC = b"PR2MAPS1"
-VERSION = 3
+VERSION = 4
 
 # `<` throughout: little-endian and unpadded, so the struct module and the C
 # `#pragma pack(1)` describe the same bytes on any host.
-_HEADER = struct.Struct("<8s5I16f3I")
+_HEADER = struct.Struct("<8s5I16f5I")
 _OUTPUT_HEADER = struct.Struct("<8s3I")
 
 BINARY_NAME = "paintr2_bake"
@@ -292,12 +292,61 @@ def high_poly_indexed(obj, depsgraph):
         evaluated.to_mesh_clear()
 
 
+def occluder_mesh(objects, depsgraph):
+    """Other models, as one indexed mesh that only stops AO rays.
+
+    Positions and indices and nothing else -- no UVs, no normals. The baker
+    shades nothing off these; it only asks whether a ray from the model being
+    baked ran into one of them. Modifiers count, for the same reason they do
+    on a high-poly: what is drawn next to the model is what shadows it.
+
+    Returns (verts, tris, positions, indices), or None when there is nothing.
+    """
+    positions = []
+    indices = []
+    base = 0
+    for obj in objects:
+        evaluated, mesh, matrix, _normal_matrix = _evaluated(obj, depsgraph)
+        try:
+            mesh.calc_loop_triangles()
+            triangles = len(mesh.loop_triangles)
+            vertices = len(mesh.vertices)
+            if triangles == 0 or vertices == 0:
+                continue
+
+            coords = np.empty(vertices * 3, dtype=np.float64)
+            mesh.vertices.foreach_get("co", coords)
+            positions.append(_to_world(coords.reshape(-1, 3), matrix))
+
+            tris = np.empty(triangles * 3, dtype=np.int64)
+            mesh.loop_triangles.foreach_get("vertices", tris)
+            indices.append((tris + base).astype(np.uint32))
+            base += vertices
+        finally:
+            evaluated.to_mesh_clear()
+
+    if not indices:
+        return None
+    stacked = np.concatenate(indices)
+    return base, len(stacked) // 3, np.concatenate(positions), stacked
+
+
 # --- the wire ----------------------------------------------------------------
 
 
-def write_input(path, low, high, size, samples, maps, params, flags=0):
-    """Write the `.pr2b` the baker reads. `high` may be None."""
+def write_input(path, low, high, size, samples, maps, params, flags=0,
+                occluders=None):
+    """Write the `.pr2b` the baker reads. `high` and `occluders` may be None.
+
+    `occluders` is `occluder_mesh()`'s (verts, tris, positions, indices).
+    """
     low_tris, soup = low
+
+    if occluders is None or occluders[1] == 0:
+        occ_verts = occ_tris = 0
+        occ_pos = occ_idx = None
+    else:
+        occ_verts, occ_tris, occ_pos, occ_idx = occluders
 
     if high is None:
         high_verts = high_tris = 0
@@ -311,13 +360,16 @@ def write_input(path, low, high, size, samples, maps, params, flags=0):
         handle.write(_HEADER.pack(
             INPUT_MAGIC, VERSION, size, samples, maps, flags,
             *padded[:PARAM_COUNT],
-            low_tris, high_verts, high_tris,
+            low_tris, high_verts, high_tris, occ_verts, occ_tris,
         ))
         handle.write(soup.tobytes())
         if high is not None:
             handle.write(high_pos.tobytes())
             handle.write(high_nrm.tobytes())
             handle.write(high_idx.tobytes())
+        if occ_tris:
+            handle.write(occ_pos.tobytes())
+            handle.write(occ_idx.tobytes())
 
 
 def read_output(path):
@@ -464,8 +516,12 @@ class Job:
                 pass
 
 
-def prepare(obj, high, directory, size, samples, maps, options):
+def prepare(obj, high, directory, size, samples, maps, options,
+            occluders=()):
     """Write the input file for one object. Returns its path.
+
+    `occluders` are the other objects whose surfaces shadow this one's AO and
+    bent normal -- see `meshmaps.occluders_for`. Nothing else reads them.
 
     `options` is a `meshmaps.BakeOptions`; taking it rather than a pile of
     numbers keeps the two backends reading the same settings, which is what
@@ -474,6 +530,9 @@ def prepare(obj, high, directory, size, samples, maps, options):
     depsgraph = bpy.context.evaluated_depsgraph_get()
     low = low_poly_soup(obj, depsgraph)
     packed = high_poly_indexed(high, depsgraph) if high is not None else None
+    wants_occlusion = maps & (MAP_BITS['AO'] | MAP_BITS['BENT_NORMAL'])
+    blockers = (occluder_mesh(occluders, depsgraph)
+                if occluders and wants_occlusion else None)
 
     from . import meshmaps
 
@@ -508,7 +567,8 @@ def prepare(obj, high, directory, size, samples, maps, options):
         flags |= FLAG_AO_IGNORE_BACKFACE
 
     path = os.path.join(directory, f"paintr2_{abs(hash(obj.name)):x}.pr2b")
-    write_input(path, low, packed, size, samples, maps, params, flags)
+    write_input(path, low, packed, size, samples, maps, params, flags,
+                occluders=blockers)
     return path
 
 
