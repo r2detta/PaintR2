@@ -371,6 +371,8 @@ class UIRoot(Container):
         # else in `gui/`: the toolkit is not allowed to hold an RNA wrapper.
         self.on_object_select = None
         self.on_material_select = None
+        # (slot) -> tick or untick that material for the mesh map bake.
+        self.on_material_bake_toggle = None
         # Both answer whether they did anything, so an unclaimed Ctrl C or
         # Ctrl V goes on to Blender instead of being eaten here.
         self.on_layer_copy = None
@@ -792,6 +794,7 @@ class UIRoot(Container):
         self.material_list.empty_text = "No materials"
         self.material_list.draw_row = self._draw_material_row
         self.material_list.on_activate = self._on_material_activate
+        self.material_list.on_row_click = self._on_material_row_click
         self.targets.add(self.material_list, height=None)
         self._material_list_index = len(self.targets.child_heights) - 1
 
@@ -1992,7 +1995,8 @@ class UIRoot(Container):
         produced it, pointing at whatever now sits at that index.
 
         Each object row: `{"name", "materials", "no_uv", "prepared"}`.
-        Each material row: `{"name", "layers", "prepared", "color"}`.
+        Each material row: `{"name", "layers", "prepared", "color", "bake"}`;
+        `bake` is absent on an empty slot, which has no checkbox.
         """
         self._object_rows = list(objects)
         self._material_rows = list(materials)
@@ -2089,8 +2093,23 @@ class UIRoot(Container):
         right = x + width - pad
         draw.text(right - count_w, text_y, count, size, theme.WIDGET_TEXT_DIM)
 
-        chip = self.px(self.TARGET_ROW - 10)
+        # The bake tick first, at the left edge, so the column of them reads
+        # as one list of "which texture sets get maps".
         chip_x = x + pad
+        box = self._material_bake_box(x, y, height)
+        if box is not None and "bake" in item:
+            bx, by, bsize = box
+            on = bool(item.get("bake"))
+            draw.widget(
+                bx, by, bsize, bsize, theme.radius(bsize, self._ui_scale, 0.2),
+                theme.WIDGET_ACTIVE if on else theme.WIDGET,
+                outline=theme.OUTLINE, emboss=theme.EMBOSS,
+            )
+            if on:
+                icons.check(bx, by, bsize, theme.WIDGET_TEXT_SEL)
+        chip_x += self._material_bake_width()
+
+        chip = self.px(self.TARGET_ROW - 10)
         colour = item.get("color")
         if colour is not None:
             draw.rounded_rect(
@@ -2123,6 +2142,28 @@ class UIRoot(Container):
         if not 0 <= index < len(self._object_rows):
             return
         self._emit(self.on_object_select, self._object_rows[index]["name"])
+
+    def _material_bake_box(self, x, y, height):
+        """(x, y, size) of a material row's bake checkbox."""
+        size = self.px(theme.FONT_SIZE + 2)
+        return x + self.px(theme.LIST_ROW_PAD), y + (height - size) // 2, size
+
+    def _material_bake_width(self):
+        """How far the checkbox pushes the rest of the row right."""
+        return self.px(theme.FONT_SIZE + 2) + self.px(theme.LIST_CHIP_GAP + 2)
+
+    def _on_material_row_click(self, index, local_x, _local_y, alt=False,
+                               shift=False):
+        """A click on the checkbox ticks it and selects nothing."""
+        if not 0 <= index < len(self._material_rows):
+            return False
+        row = self._material_rows[index]
+        if "bake" not in row:
+            return False
+        if local_x >= self.px(theme.LIST_ROW_PAD) + self._material_bake_width():
+            return False
+        self._emit(self.on_material_bake_toggle, row.get("slot", index))
+        return True
 
     def _on_material_activate(self, index, extend=False, span=False,
                               local_x=None):

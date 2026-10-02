@@ -311,9 +311,461 @@ def bake_channels(obj, channels, size, margin=16, float_buffer=False,
     return out
 
 
+# --- one bake for many models ------------------------------------------------
+#
+# Cycles bakes objects one at a time, even inside one `object.bake` call: every
+# object costs a full-size pixel array and a scene sync. Measured, 20 cubes on
+# one material, 3 channels at 2K: 32 s one call per model, 28 s one call for
+# all of them. What is fast is *one object* -- so models that share a material
+# are joined into a throwaway mesh and baked once.
+#
+# That is only right when the channel does not care which object a point
+# belongs to. A paint layer reads UVs, and joined UVs are the same UVs; a
+# procedural reading Object coordinates would read the proxy's instead. So
+# the graph feeding the channel is checked first, and anything not on the
+# list below sends the bake down the slow, always-right path.
+
+# Nodes whose output depends only on their inputs.
+_PURE_NODES = frozenset({
+    'ShaderNodeMath', 'ShaderNodeVectorMath', 'ShaderNodeMix',
+    'ShaderNodeMixRGB', 'ShaderNodeMapRange', 'ShaderNodeClamp',
+    'ShaderNodeValue', 'ShaderNodeRGB', 'ShaderNodeInvert',
+    'ShaderNodeHueSaturation', 'ShaderNodeGamma', 'ShaderNodeBrightContrast',
+    'ShaderNodeValToRGB', 'ShaderNodeRGBCurve', 'ShaderNodeFloatCurve',
+    'ShaderNodeVectorCurve', 'ShaderNodeMapping', 'ShaderNodeRGBToBW',
+    'ShaderNodeSeparateColor', 'ShaderNodeCombineColor',
+    'ShaderNodeSeparateXYZ', 'ShaderNodeCombineXYZ', 'ShaderNodeVectorRotate',
+    'NodeReroute', 'NodeGroupOutput',
+})
+
+# Textures that read an implicit coordinate when their Vector is unlinked:
+# Generated for all of them, which is the object's own box. Linked, they are
+# as pure as what feeds them.
+_TEXTURE_NODES = frozenset({
+    'ShaderNodeTexNoise', 'ShaderNodeTexChecker', 'ShaderNodeTexVoronoi',
+    'ShaderNodeTexWave', 'ShaderNodeTexGradient', 'ShaderNodeTexMagic',
+    'ShaderNodeTexBrick', 'ShaderNodeTexGabor',
+})
+
+
+# The per-object coordinates a joined proxy can carry for each model, as
+# attributes, standing in for the Texture Coordinate outputs of the same name.
+_COORDINATES = ("Object", "Generated", "Normal")
+
+
+def _uv_only(material, channel):
+    """True when `channel` of `material` reads nothing but UVs and constants."""
+    return _join_needs(material, channel) == set()
+
+
+def _join_needs(material, channel):
+    """What a joined bake of `channel` needs carried per model, or None.
+
+    An empty set: UVs and constants only. A set of `_COORDINATES`: the graph
+    also reads those, and the proxy can carry them (`_CoordinateSwap`). None:
+    it reads something no proxy can reproduce, and the models are baked as
+    themselves.
+    """
+    from . import document as doc
+
+    tree = material.node_tree
+    group_node = tree.nodes.get(nodegen._OWNED["group"]) if tree else None
+    if group_node is None:
+        return None
+    socket = group_node.outputs.get(doc.channel_label(channel))
+    if socket is None:
+        return None
+
+    seen = set()
+    needs = set()
+
+    def links_into(node_socket, links):
+        return [link for link in links
+                if link.to_socket == node_socket and not link.is_muted]
+
+    def walk(output, links, outer):
+        """`outer` is the chain of (group node, parent links) we are inside."""
+        node = output.node
+        key = (node.as_pointer(), output.identifier, len(outer))
+        if key in seen:
+            return True
+        seen.add(key)
+
+        kind = node.bl_idname
+        if kind == 'ShaderNodeGroup':
+            inner = node.node_tree
+            if inner is None:
+                return False
+            out = next((n for n in inner.nodes
+                        if n.bl_idname == 'NodeGroupOutput'
+                        and n.is_active_output), None) or next(
+                (n for n in inner.nodes if n.bl_idname == 'NodeGroupOutput'),
+                None)
+            if out is None:
+                return True
+            target = next((i for i in out.inputs
+                           if i.identifier == output.identifier), None)
+            if target is None:
+                return True
+            return walk_input(target, inner.links, outer + [(node, links)])
+
+        if kind == 'NodeGroupInput':
+            if not outer:
+                return False
+            group, parent_links = outer[-1]
+            target = next((i for i in group.inputs
+                           if i.identifier == output.identifier), None)
+            if target is None:
+                return True
+            return walk_input(target, parent_links, outer[:-1])
+
+        if kind == 'ShaderNodeTexCoord':
+            if output.name == "UV":
+                return True
+            if output.name in _COORDINATES and getattr(node, "object", None) is None:
+                needs.add(output.name)
+                return True
+            return False
+        if kind == 'ShaderNodeUVMap':
+            return not node.uv_map
+        if kind == 'ShaderNodeTexImage':
+            vector = node.inputs.get("Vector")
+            return node.projection == 'FLAT' and (
+                vector is None or walk_input(vector, links, outer, implicit=True))
+        if kind in _TEXTURE_NODES:
+            vector = node.inputs.get("Vector")
+            if vector is None:
+                return False
+            if not links_into(vector, links):
+                # Unlinked, a procedural texture reads Generated.
+                needs.add("Generated")
+        elif kind not in _PURE_NODES:
+            return False
+
+        return all(walk_input(i, links, outer) for i in node.inputs
+                   if i.enabled)
+
+    def walk_input(node_input, links, outer, implicit=False):
+        incoming = links_into(node_input, links)
+        if not incoming:
+            return True
+        return all(walk(link.from_socket, links, outer) for link in incoming)
+
+    try:
+        return needs if walk(socket, tree.links, []) else None
+    except (AttributeError, ReferenceError, RuntimeError):
+        return None
+
+
+class _CannotJoin(Exception):
+    """A model the proxy cannot stand in for; bake the models as themselves."""
+
+
+def _attribute_name(coordinate):
+    return f"PaintR2 {coordinate}"
+
+
+class _CoordinateSwap:
+    """Point the materials' Texture Coordinate outputs at the proxy's
+    attributes, for the length of one bake.
+
+    Every `Object` / `Generated` / `Normal` link out of a Texture Coordinate
+    node -- nested groups included -- is moved onto an Attribute node reading
+    the same coordinate off the proxy, and a procedural texture with nothing
+    in its Vector gets Generated linked in explicitly. Undone on exit by name,
+    since node and socket wrappers do not survive the tree changing.
+    """
+
+    def __init__(self, materials):
+        self.materials = list(materials)
+        self.added = []      # (tree, node name)
+        self.moved = []      # (tree, from node, from id, to node, to id)
+        self.sources = {}
+
+    def _source(self, tree, coordinate):
+        key = (tree.as_pointer(), coordinate)
+        if key in self.sources:
+            return self.sources[key]
+        attribute = tree.nodes.new('ShaderNodeAttribute')
+        attribute.attribute_type = 'GEOMETRY'
+        attribute.attribute_name = _attribute_name(coordinate)
+        self.added.append((tree, attribute.name))
+        socket = attribute.outputs["Vector"]
+        if coordinate == "Normal":
+            # Interpolated across a smooth face, an attribute is not unit
+            # length; the shading normal Cycles hands out is.
+            normalize = tree.nodes.new('ShaderNodeVectorMath')
+            normalize.operation = 'NORMALIZE'
+            self.added.append((tree, normalize.name))
+            tree.links.new(socket, normalize.inputs[0])
+            socket = normalize.outputs["Vector"]
+        self.sources[key] = socket
+        return socket
+
+    def __enter__(self):
+        visited = set()
+
+        def visit(tree):
+            if tree is None or tree.as_pointer() in visited:
+                return
+            visited.add(tree.as_pointer())
+            for node in list(tree.nodes):
+                kind = node.bl_idname
+                if kind == 'ShaderNodeGroup':
+                    visit(node.node_tree)
+                elif kind == 'ShaderNodeTexCoord':
+                    for link in list(tree.links):
+                        if link.from_node != node or \
+                                link.from_socket.name not in _COORDINATES:
+                            continue
+                        record = (tree, node.name, link.from_socket.identifier,
+                                  link.to_node.name, link.to_socket.identifier)
+                        to_socket = link.to_socket
+                        coordinate = link.from_socket.name
+                        tree.links.remove(link)
+                        tree.links.new(self._source(tree, coordinate), to_socket)
+                        self.moved.append(record)
+                elif kind in _TEXTURE_NODES:
+                    vector = node.inputs.get("Vector")
+                    if vector is not None and not vector.is_linked:
+                        tree.links.new(self._source(tree, "Generated"), vector)
+
+        for material in self.materials:
+            visit(material.node_tree)
+        return self
+
+    def __exit__(self, *exc):
+        # Removing the added nodes takes every link they made with them.
+        for tree, name in self.added:
+            node = tree.nodes.get(name)
+            if node is not None:
+                tree.nodes.remove(node)
+        for tree, from_node, from_id, to_node, to_id in self.moved:
+            source = tree.nodes.get(from_node)
+            target = tree.nodes.get(to_node)
+            if source is None or target is None:
+                continue
+            out = next((o for o in source.outputs if o.identifier == from_id), None)
+            into = next((i for i in target.inputs if i.identifier == to_id), None)
+            if out is not None and into is not None:
+                tree.links.new(out, into)
+        self.added, self.moved, self.sources = [], [], {}
+        return False
+
+
+class _JoinedProxy:
+    """The models, joined into one throwaway object, for one bake.
+
+    Evaluated meshes in world space, the render-active UV map of each (what
+    `TexCoord.UV` reads), and only the faces of `materials` -- a slot without
+    a bake target would make Cycles refuse the bake. Removed on exit, mesh and
+    all.
+    """
+
+    def __init__(self, objects, materials, needs=()):
+        self.objects = objects
+        self.materials = list(materials)
+        self.needs = set(needs)
+        self.obj = None
+
+    def __enter__(self):
+        import numpy as np
+
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        coords, loop_verts, loop_starts, mat_index, uvs = [], [], [], [], []
+        # Per model, in the proxy's own vertex / corner order.
+        carried = {name: [] for name in self.needs}
+        vertex_base = 0
+        loop_base = 0
+
+        for model in self.objects:
+            evaluated = model.evaluated_get(depsgraph)
+            mesh = evaluated.to_mesh()
+            try:
+                layer = next((l for l in mesh.uv_layers if l.active_render),
+                             mesh.uv_layers.active)
+                if layer is None:
+                    raise RuntimeError(f"{model.name} has no UV map")
+
+                n_verts, n_loops = len(mesh.vertices), len(mesh.loops)
+
+                co = np.empty(n_verts * 3, dtype=np.float64)
+                mesh.vertices.foreach_get("co", co)
+                matrix = np.array(evaluated.matrix_world, dtype=np.float64)
+                co_local = co.reshape(-1, 3)
+                co = co_local @ matrix[:3, :3].T + matrix[:3, 3]
+
+                verts = np.empty(n_loops, dtype=np.int32)
+                mesh.loops.foreach_get("vertex_index", verts)
+                uv = np.empty(n_loops * 2, dtype=np.float32)
+                layer.uv.foreach_get("vector", uv)
+                uv = uv.reshape(-1, 2)
+
+                # Triangles, not polygons: the proxy is built from Blender's
+                # own triangulation, which is the one Cycles renders. On a
+                # quad that is not planar the two halves face different ways,
+                # and a flat-shaded Normal is the *triangle's* -- measured, a
+                # polygon normal disagreed on 4% of a wall's texels.
+                mesh.calc_loop_triangles()
+                n_tris = len(mesh.loop_triangles)
+                tri_loops = np.empty(n_tris * 3, dtype=np.int32)
+                mesh.loop_triangles.foreach_get("loops", tri_loops)
+                tri_loops = tri_loops.reshape(-1, 3)
+                indices = np.empty(n_tris, dtype=np.int32)
+                mesh.loop_triangles.foreach_get("material_index", indices)
+
+                remap = np.array([
+                    self.materials.index(slot.material)
+                    if slot.material in self.materials else -1
+                    for slot in model.material_slots
+                ] or [-1], dtype=np.int32)
+                indices = remap[np.clip(indices, 0, len(remap) - 1)]
+                keep = indices >= 0
+                if not keep.any():
+                    continue
+
+                picked = tri_loops[keep].reshape(-1)
+                indices = indices[keep]
+
+                if "Object" in self.needs:
+                    carried["Object"].append(co_local)
+                if "Generated" in self.needs:
+                    carried["Generated"].append(self._generated(model, co_local))
+                if "Normal" in self.needs:
+                    carried["Normal"].append(
+                        self._normals(mesh, n_loops, n_tris, tri_loops)[keep]
+                        .reshape(-1, 3))
+
+                coords.append(co)
+                loop_verts.append(verts[picked] + vertex_base)
+                uvs.append(uv[picked])
+                loop_starts.append(np.arange(len(indices)) * 3 + loop_base)
+                mat_index.append(indices)
+                vertex_base += n_verts
+                loop_base += len(picked)
+            finally:
+                evaluated.to_mesh_clear()
+
+        if not loop_starts:
+            raise RuntimeError("none of the models has a face to bake")
+
+        mesh = bpy.data.meshes.new("PaintR2 Bake Proxy")
+        mesh.vertices.add(vertex_base)
+        mesh.vertices.foreach_set("co", np.concatenate(coords).ravel())
+        mesh.loops.add(loop_base)
+        mesh.loops.foreach_set("vertex_index", np.concatenate(loop_verts))
+        starts = np.concatenate(loop_starts)
+        mesh.polygons.add(len(starts))
+        mesh.polygons.foreach_set("loop_start", starts)
+        mesh.polygons.foreach_set("material_index", np.concatenate(mat_index))
+        layer = mesh.uv_layers.new(name="UVMap")
+        layer.uv.foreach_set("vector", np.concatenate(uvs).ravel())
+        for name, chunks in carried.items():
+            domain = 'CORNER' if name == "Normal" else 'POINT'
+            attribute = mesh.attributes.new(
+                _attribute_name(name), 'FLOAT_VECTOR', domain)
+            attribute.data.foreach_set(
+                "vector", np.concatenate(chunks).astype(np.float32).ravel())
+        mesh.update(calc_edges=True)
+        for material in self.materials:
+            mesh.materials.append(material)
+
+        self.obj = bpy.data.objects.new("PaintR2 Bake Proxy", mesh)
+        bpy.context.scene.collection.objects.link(self.obj)
+        bpy.context.view_layer.update()
+        return self.obj
+
+    @staticmethod
+    def _normals(mesh, n_loops, n_tris, tri_loops):
+        """What `TexCoord.Normal` reads at each triangle corner, in object
+        space, as an (n_tris, 3, 3) array: the corner normal on a smooth
+        triangle, the triangle's own geometric normal on a flat one."""
+        import numpy as np
+
+        corner = np.empty(n_loops * 3, dtype=np.float32)
+        mesh.corner_normals.foreach_get("vector", corner)
+        out = corner.reshape(-1, 3)[tri_loops]
+
+        smooth = np.empty(n_tris, dtype=bool)
+        mesh.loop_triangles.foreach_get("use_smooth", smooth)
+        flat = np.empty(n_tris * 3, dtype=np.float32)
+        mesh.loop_triangles.foreach_get("normal", flat)
+        flat = flat.reshape(-1, 3)
+        out[~smooth] = flat[~smooth][:, None, :]
+        return out
+
+    @staticmethod
+    def _generated(model, co):
+        """Cycles' Generated coordinate for each vertex of `model`.
+
+        Generated is the *original* coordinate (orco) mapped through the
+        mesh's texture space: `(orco - location) / (2 * size) + 0.5`, with a
+        zero size giving a flat 0.5 -- Cycles' own `mesh_texture_space`. With
+        modifiers the orco is the undeformed vertex, which can be read back
+        only while the vertex count is unchanged; otherwise the models are
+        baked as themselves.
+        """
+        import numpy as np
+
+        data = model.data
+        if len(data.vertices) != len(co):
+            raise _CannotJoin(f"{model.name}: modifiers change its vertices")
+        if model.modifiers:
+            orco = np.empty(len(data.vertices) * 3, dtype=np.float64)
+            data.vertices.foreach_get("co", orco)
+            orco = orco.reshape(-1, 3)
+        else:
+            orco = co
+        location = np.array(data.texspace_location, dtype=np.float64)
+        size = np.array(data.texspace_size, dtype=np.float64)
+        scale = np.divide(0.5, size, out=np.zeros(3), where=size != 0.0)
+        return orco * scale - (location * scale - 0.5)
+
+    def __exit__(self, *exc):
+        if self.obj is not None:
+            mesh = self.obj.data
+            bpy.data.objects.remove(self.obj, do_unlink=True)
+            bpy.data.meshes.remove(mesh)
+            self.obj = None
+        return False
+
+
+def _bake_joined(context, objects, materials, channel):
+    """The fast path: one object, one bake, the user's own margin -- and with
+    every island in one object, Blender's margin sees all of them and cannot
+    spill over any. False when the models cannot be joined."""
+    needs = set()
+    for material in materials:
+        wanted = _join_needs(material, channel)
+        if wanted is None:
+            return False
+        needs |= wanted
+
+    proxy = _JoinedProxy(objects, materials, needs)
+    try:
+        proxy_obj = proxy.__enter__()
+    except _CannotJoin:
+        proxy.__exit__(None, None, None)
+        return False
+    try:
+        with _CoordinateSwap(materials) if needs else contextlib.nullcontext():
+            select_only(context, proxy_obj)
+            bpy.ops.object.bake(type='EMIT')
+    finally:
+        proxy.__exit__(None, None, None)
+    return True
+
+
 def bake_object(obj, size, margin=16, float_buffer=False, channel='BASE_COLOR',
                 settings=None):
     """Bake one channel of every PaintR2 material on `obj` into its own image.
+
+    `obj` may also be a list of models. **Models that share a material share
+    its image**: they are baked together in one call at margin 0, so
+    every model's islands land in it and nothing spills over a neighbour's,
+    and the image is filled once afterwards. Baking them one call
+    each, as the export used to, blanked the shared image every time -- the
+    texture that came out held only the last model's UVs.
 
     Returns a BakeResult. The scene's bake settings are restored afterwards,
     the temporary target nodes are always removed and the material is always
@@ -325,16 +777,25 @@ def bake_object(obj, size, margin=16, float_buffer=False, channel='BASE_COLOR',
     its own, which is what a single call has always done.
     """
     result = BakeResult()
+    objects = list(obj) if isinstance(obj, (list, tuple)) else [obj]
 
-    if obj is None or obj.type != 'MESH':
-        result.error = RuntimeError("Select a mesh object")
-        return result
+    for model in objects:
+        if model is None or model.type != 'MESH':
+            result.error = RuntimeError("Select a mesh object")
+            return result
 
-    if not obj.data.uv_layers:
-        result.error = RuntimeError(f"{obj.name} has no UV map")
-        return result
+        if not model.data.uv_layers:
+            result.error = RuntimeError(f"{model.name} has no UV map")
+            return result
 
-    materials = paint_materials(obj)
+    # Which models carry which material, in slot order, once each.
+    users = {}
+    for model in objects:
+        for material in paint_materials(model):
+            users.setdefault(material, [])
+            if model not in users[material]:
+                users[material].append(model)
+    materials = list(users)
     if not materials:
         result.error = RuntimeError("No PaintR2 material on this object")
         return result
@@ -379,8 +840,6 @@ def bake_object(obj, size, margin=16, float_buffer=False, channel='BASE_COLOR',
     previous_active = context.view_layer.objects.active
 
     try:
-        select_only(context, obj)
-
         if previous.get("engine") is None and scene.render.engine != BAKE_ENGINE:
             raise RuntimeError(
                 "Baking needs the Cycles render engine, which is not available "
@@ -393,7 +852,26 @@ def bake_object(obj, size, margin=16, float_buffer=False, channel='BASE_COLOR',
         for _material, image, _node in targets:
             dilate.blank(image)
 
-        bpy.ops.object.bake(type='EMIT')
+        if len(objects) == 1:
+            select_only(context, objects[0])
+            bpy.ops.object.bake(type='EMIT')
+        elif _bake_joined(context, objects, materials, channel):
+            pass
+        else:
+            # A channel that reads more than UVs, so the models cannot be
+            # joined: one bake call for all of them instead. Cycles bakes every
+            # selected object into its own materials' active image, and a
+            # shared image collects every object's islands: what it does not
+            # write it leaves alone (`use_clear` is off). One call per model
+            # used to cost a scene sync and kernel setup each, plus a full-size
+            # readback to merge -- 20 models, 3 channels, 2K: 32 s.
+            #
+            # Margin 0, so a model's margin cannot land on another model's
+            # islands; `dilate.fill` below gives every island its margin.
+            select_only(context, objects[0])
+            for model in objects[1:]:
+                model.select_set(True)
+            bpy.ops.object.bake(type='EMIT', margin=0)
 
         # Everything past the margin is still black with no alpha, and an
         # exported texture carries that black into whatever renders it: the

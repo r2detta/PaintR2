@@ -681,6 +681,7 @@ def _target_rows(context):
                 "layers": len(document.layers),
                 "prepared": prepare.is_paint_material(material),
                 "color": tuple(material.diffuse_color),
+                "bake": document.bake_enabled,
             })
 
     return objects, materials, active_object, active_material
@@ -693,6 +694,20 @@ def _select_object(name):
 def _select_material(slot):
     _run(f"select material slot {slot}",
          bpy.ops.paintr2.select_material, index=slot)
+
+
+def _toggle_material_bake(slot):
+    """Tick or untick a material for the mesh map bake."""
+    obj = getattr(bpy.context, "active_object", None)
+    if obj is None or not 0 <= slot < len(obj.material_slots):
+        return
+    material = obj.material_slots[slot].material
+    if material is None:
+        return
+    document = material.paintr2
+    document.bake_enabled = not document.bake_enabled
+    bpy.ops.ed.undo_push(message="Toggle Material Bake")
+    session.tag_redraw()
 
 
 def _copy_layers():
@@ -2439,20 +2454,26 @@ def _map_rows(context):
     elif not any(getattr(props, "bake_map_" + i.lower())
                  for i in meshmaps.MAP_IDS):
         problem = "No map selected"
+    else:
+        from .ops import op_meshmaps
+        if not op_meshmaps.bake_groups(context):
+            problem = "No material ticked for baking"
 
     if problem:
         rows.append({"kind": 'label', "label": problem, "active": False})
 
     # Counted by the operator's own rule, so the button cannot promise a
-    # different number of models than the bake then makes.
+    # different number of texture sets than the bake then makes. Maps are
+    # per material, so that is what is counted.
     from .ops import op_meshmaps
-    models = op_meshmaps.bake_targets(context)
+    groups = op_meshmaps.bake_groups(context)
 
     rows.append({
         "kind": 'button',
-        "label": "Bake Mesh Maps" if len(models) <= 1
-        else f"Bake {len(models)} Models",
-        "desc": "Bake the ticked maps for the models the Bake row names",
+        "label": "Bake Mesh Maps" if len(groups) <= 1
+        else f"Bake {len(groups)} Materials",
+        "desc": "Bake the ticked maps, one set per material of the models "
+                "the Bake row names",
         "action": ('bake_maps',),
         "active": not problem,
     })
@@ -2579,9 +2600,13 @@ def _export_targets(context):
         return [], {}
 
     targets = op_export._targets(context)
-    if scene.paintr2.export_active_only:
+    if scene.paintr2.export_active_only and targets:
         active = getattr(context, "active_object", None)
-        targets = [active] if active in targets else targets[:1]
+        chosen = active if active in targets else targets[0]
+        # With the models that share its materials -- the operator bakes
+        # those too, or the texture would hold only the active one's UVs.
+        targets = next((g for g in op_export._texture_groups(targets)
+                        if chosen in g), [chosen])
 
     channels = {}
     for obj in targets:
@@ -5460,6 +5485,7 @@ def _make_root():
     root.on_fill_prop = _set_fill_prop
     root.on_object_select = _select_object
     root.on_material_select = _select_material
+    root.on_material_bake_toggle = _toggle_material_bake
     root.on_layer_copy = _copy_layers
     root.on_layer_paste = _paste_layers
     root.on_symmetry_toggle = _set_symmetry

@@ -177,7 +177,31 @@ def _triangulate_ngons(mesh):
         bm.free()
 
 
-def low_poly_soup(obj, depsgraph):
+def material_slots(obj, material):
+    """The slot indices that hold `material`, or None for "every face".
+
+    None also when every slot holds it: then there is nothing to leave out,
+    and the bake is byte for byte the one a model with one material always had.
+    """
+    if material is None:
+        return None
+    slots = [i for i, slot in enumerate(obj.material_slots)
+             if slot.material == material]
+    if len(slots) == len(obj.material_slots):
+        return None
+    return set(slots)
+
+
+def _triangles_in(mesh, slots):
+    """A mask over `mesh.loop_triangles` of the ones in `slots`, or None."""
+    if slots is None:
+        return None
+    indices = np.empty(len(mesh.loop_triangles), dtype=np.int32)
+    mesh.loop_triangles.foreach_get("material_index", indices)
+    return np.isin(indices, list(slots))
+
+
+def low_poly_soup(obj, depsgraph, slots=None):
     """The low-poly as a triangle soup: 3 corners of position, normal, uv,
     tangent and bitangent sign.
 
@@ -196,6 +220,10 @@ def low_poly_soup(obj, depsgraph):
     tangent recomputed here from the UVs would be close and not identical, and
     the result of that is not an error message -- it is every dent lit slightly
     askew, on a map that looks right until it is next to one that is.
+
+    `slots` keeps only the faces of those material slots (`material_slots`):
+    a map belongs to a material, and the model's other materials have their
+    own maps -- often over the same 0..1 square.
     """
     evaluated, mesh, matrix, normal_matrix = _evaluated(obj, depsgraph)
     try:
@@ -216,6 +244,13 @@ def low_poly_soup(obj, depsgraph):
 
         loops = np.empty(triangles * 3, dtype=np.int32)
         mesh.loop_triangles.foreach_get("loops", loops)
+
+        keep = _triangles_in(mesh, slots)
+        if keep is not None:
+            loops = loops.reshape(-1, 3)[keep].reshape(-1)
+            triangles = int(keep.sum())
+            if triangles == 0:
+                raise RuntimeError(f"{obj.name} has no faces of this material")
 
         loop_vertex = np.empty(len(mesh.loops), dtype=np.int32)
         mesh.loops.foreach_get("vertex_index", loop_vertex)
@@ -292,7 +327,34 @@ def high_poly_indexed(obj, depsgraph):
         evaluated.to_mesh_clear()
 
 
-def occluder_mesh(objects, depsgraph):
+def other_faces(obj, depsgraph, slots):
+    """The faces of `obj` *outside* `slots`, as (positions, indices), or None.
+
+    Left out of the soup because they are another material's texture, they
+    are still this model's surface and still shadow it -- so they go to the
+    baker as occluders, which is what keeps AO the same as it was before the
+    model was split by material.
+    """
+    if slots is None:
+        return None
+    evaluated, mesh, matrix, _normal_matrix = _evaluated(obj, depsgraph)
+    try:
+        mesh.calc_loop_triangles()
+        keep = _triangles_in(mesh, slots)
+        if keep is None or keep.all():
+            return None
+        tris = np.empty(len(mesh.loop_triangles) * 3, dtype=np.int64)
+        mesh.loop_triangles.foreach_get("vertices", tris)
+        tris = tris.reshape(-1, 3)[~keep].reshape(-1)
+
+        coords = np.empty(len(mesh.vertices) * 3, dtype=np.float64)
+        mesh.vertices.foreach_get("co", coords)
+        return _to_world(coords.reshape(-1, 3), matrix), tris
+    finally:
+        evaluated.to_mesh_clear()
+
+
+def occluder_mesh(objects, depsgraph, extra=None):
     """Other models, as one indexed mesh that only stops AO rays.
 
     Positions and indices and nothing else -- no UVs, no normals. The baker
@@ -300,11 +362,19 @@ def occluder_mesh(objects, depsgraph):
     baked ran into one of them. Modifiers count, for the same reason they do
     on a high-poly: what is drawn next to the model is what shadows it.
 
+    `extra` is one more (positions, indices) pair already in world space --
+    `other_faces`.
+
     Returns (verts, tris, positions, indices), or None when there is nothing.
     """
     positions = []
     indices = []
     base = 0
+    if extra is not None:
+        extra_positions, extra_indices = extra
+        positions.append(extra_positions)
+        indices.append(extra_indices.astype(np.uint32))
+        base = len(extra_positions)
     for obj in objects:
         evaluated, mesh, matrix, _normal_matrix = _evaluated(obj, depsgraph)
         try:
@@ -517,8 +587,11 @@ class Job:
 
 
 def prepare(obj, high, directory, size, samples, maps, options,
-            occluders=()):
+            occluders=(), material=None):
     """Write the input file for one object. Returns its path.
+
+    `material` limits the bake to that material's faces -- the map is the
+    material's, and the model's other faces stay on as occluders only.
 
     `occluders` are the other objects whose surfaces shadow this one's AO and
     bent normal -- see `meshmaps.occluders_for`. Nothing else reads them.
@@ -528,11 +601,17 @@ def prepare(obj, high, directory, size, samples, maps, options,
     makes switching between them a fair comparison instead of a surprise.
     """
     depsgraph = bpy.context.evaluated_depsgraph_get()
-    low = low_poly_soup(obj, depsgraph)
+    slots = material_slots(obj, material)
+    low = low_poly_soup(obj, depsgraph, slots)
     packed = high_poly_indexed(high, depsgraph) if high is not None else None
     wants_occlusion = maps & (MAP_BITS['AO'] | MAP_BITS['BENT_NORMAL'])
-    blockers = (occluder_mesh(occluders, depsgraph)
-                if occluders and wants_occlusion else None)
+    # With a high-poly the high-poly is the shape that shadows, all of it;
+    # the low-poly's other faces would only shadow twice.
+    rest = (other_faces(obj, depsgraph, slots)
+            if wants_occlusion and high is None else None)
+    blockers = (occluder_mesh(occluders, depsgraph, extra=rest)
+                if (occluders or rest is not None) and wants_occlusion
+                else None)
 
     from . import meshmaps
 
@@ -566,14 +645,18 @@ def prepare(obj, high, directory, size, samples, maps, options,
     if options.ao_ignore_backface:
         flags |= FLAG_AO_IGNORE_BACKFACE
 
-    path = os.path.join(directory, f"paintr2_{abs(hash(obj.name)):x}.pr2b")
+    key = (obj.name, material.name if material is not None else "")
+    path = os.path.join(directory, f"paintr2_{abs(hash(key)):x}.pr2b")
     write_input(path, low, packed, size, samples, maps, params, flags,
                 occluders=blockers)
     return path
 
 
-def apply_maps(obj, produced):
+def apply_maps(material, produced):
     """Turn the baker's arrays into Blender images, filled and stored.
+
+    `material` owns them; `produced` is every model's share already laid
+    together with `meshmaps.merge_coverage`.
 
     The alpha the baker writes is its coverage mask, which is exactly what
     `dilate.fill` needs -- so the same filling the Cycles path uses runs here
@@ -588,13 +671,13 @@ def apply_maps(obj, produced):
             continue
         size = pixels.shape[0]
         image = meshmaps._ensure_image(
-            meshmaps.map_name(obj, identifier), size, entry[2],
+            meshmaps.map_name(material, identifier), size, entry[2],
             float_buffer=entry[4],
         )
         image.pixels.foreach_set(pixels.reshape(-1))
         image.update()
         dilate.fill(image)
         storage.adopt_new_image(image)
-        meshmaps._store(obj, identifier, image)
+        meshmaps._store(material, identifier, image)
         images[identifier] = image
     return images

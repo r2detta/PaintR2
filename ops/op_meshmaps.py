@@ -5,7 +5,8 @@ Two operators, in the order they are used:
 
     paintr2.measure_cage          measure the two surfaces and write the
                                   extrusion and ray distance they need
-    paintr2.bake_mesh_maps        bake, one pass per model in the paint set
+    paintr2.bake_mesh_maps        bake, one set of maps per material in the
+                                  paint set
 
 There used to be a third -- `setup_highpoly_bake`, which made the collection
 pair. "Set Models" makes `Paint` and `Paint_high` now, so a second button
@@ -71,6 +72,45 @@ def bake_targets(context):
     return [active] if active in models else models[:1]
 
 
+def bake_groups(context):
+    """[(material, [models])]: what a bake makes, and who goes into each.
+
+    **Maps are per material, not per model**. A material is a texture
+    set, and every model that carries it shares its texture -- so one map is
+    baked for all of them together. Whether their UVs overlap is the
+    artist's to keep apart, exactly as it is for the paint.
+
+    The materials are those of `bake_targets` that are ticked in the Objects /
+    Materials list (`bake_enabled`); the models in each are every
+    model that carries it. Baking only the active model still has to bake its
+    neighbours that share its material, or their half of the map would be
+    wiped by the half that was asked for.
+    """
+    models = _selected_meshes(context)
+    order = []
+    for obj in bake_targets(context):
+        for material in meshmaps.materials_of(obj):
+            if material not in order and bake_enabled(material):
+                order.append(material)
+    return [
+        (material, [obj for obj in models
+                    if material in meshmaps.materials_of(obj)])
+        for material in order
+    ]
+
+
+def bake_enabled(material):
+    """Whether the material is ticked for baking."""
+    document = getattr(material, "paintr2", None)
+    return document is None or document.bake_enabled
+
+
+def _no_material(context):
+    """The models a bake has no texture set to put a map in."""
+    return [obj.name for obj in bake_targets(context)
+            if not meshmaps.materials_of(obj)]
+
+
 def occluders(context, obj):
     """The other models that may shadow `obj`'s AO. Empty for Self Only.
 
@@ -100,6 +140,17 @@ def _dropped_note(names):
     first, in warning colour, is the difference between noticing and not.
     """
     return f"No map for {', '.join(names)}. "
+
+
+def _why(skipped):
+    """The first reason a bake made nothing -- or, with none on record, the
+    one left: every material in reach was unticked."""
+    return skipped[0] if skipped else "No material is ticked for baking"
+
+
+def _note(names, name):
+    if name not in names:
+        names.append(name)
 
 
 class PAINTR2_OT_measure_cage(bpy.types.Operator):
@@ -196,11 +247,15 @@ class PAINTR2_OT_bake_mesh_maps_external(bpy.types.Operator):
         return bool(_selected_meshes(context)) and external.available() is not None
 
     def _start_next(self, context):
-        """Kick off the next object, or return False when there are none."""
+        """Kick off the next model, or return False when there are none."""
         from .. import external as ext
 
         while self._queue:
-            obj, high = self._queue.pop(0)
+            material, obj, high = self._queue.pop(0)
+            if material != self._material:
+                self._flush()
+                self._material = material
+
             props = context.scene.paintr2
             options = meshmaps.BakeOptions.from_scene(context.scene)
 
@@ -209,9 +264,9 @@ class PAINTR2_OT_bake_mesh_maps_external(bpy.types.Operator):
                 if not getattr(props, "bake_map_" + identifier.lower(), False):
                     continue
                 if meshmaps.needs_high(identifier) and high is None:
-                    self._skipped.append(
-                        f"{obj.name}: {meshmaps.map_label(identifier)} needs a "
-                        "high-poly")
+                    _note(self._skipped,
+                          f"{obj.name}: {meshmaps.map_label(identifier)} "
+                          "needs a high-poly")
                     continue
                 wanted |= ext.MAP_BITS[identifier]
 
@@ -222,17 +277,60 @@ class PAINTR2_OT_bake_mesh_maps_external(bpy.types.Operator):
                 path = ext.prepare(
                     obj, high, self._directory, int(props.mesh_map_resolution),
                     props.mesh_map_samples, wanted, options,
-                    occluders=occluders(context, obj))
+                    occluders=occluders(context, obj), material=material)
             except Exception as error:  # noqa: BLE001
-                self._skipped.append(f"{obj.name}: {error}")
-                self._dropped.append(obj.name)
+                _note(self._skipped, f"{obj.name}: {error}")
+                _note(self._dropped, obj.name)
                 continue
 
             self._current = obj
             self._job = ext.Job(ext.available(), path, path[:-5] + ".pr2m")
             return True
 
+        self._flush()
         return False
+
+    def _flush(self):
+        """Turn the material collected so far into its images."""
+        from .. import external as ext
+
+        if self._material is not None and self._pending:
+            images = ext.apply_maps(self._material, self._pending)
+            self._maps += len(images)
+            if images:
+                self._materials += 1
+        self._pending = {}
+
+    def _queue_up(self, context):
+        """Reset the run, and line up every (material, model, high-poly)."""
+        props = context.scene.paintr2
+        self._skipped = []
+        self._dropped = []
+        self._done = 0
+        self._maps = 0
+        self._materials = 0
+        self._material = None
+        self._pending = {}
+        self._current = None
+        self._directory = tempfile.mkdtemp(prefix="paintr2_bake_")
+
+        for name in _no_material(context):
+            _note(self._skipped, f"{name} has no material to bake through")
+            _note(self._dropped, name)
+
+        self._queue = []
+        for material, models in bake_groups(context):
+            for obj in models:
+                high = None
+                if props.use_highpoly_bake:
+                    partner = paintset.find_high(obj, props.highpoly_suffix)
+                    if not partner:
+                        _note(self._skipped, partner.reason)
+                        _note(self._dropped, obj.name)
+                        continue
+                    high = partner.object
+                self._queue.append((material, obj, high))
+        self._total = len(self._queue)
 
     def execute(self, context):
         # Called when something runs the operator without a window -- a script,
@@ -241,32 +339,10 @@ class PAINTR2_OT_bake_mesh_maps_external(bpy.types.Operator):
         return self._run_blocking(context)
 
     def invoke(self, context, event):
-        from .. import external as ext
-
-        props = context.scene.paintr2
-        self._skipped = []
-        self._dropped = []
-        self._done = 0
-        self._maps = 0
-        self._current = None
-        self._directory = tempfile.mkdtemp(prefix="paintr2_bake_")
-
-        self._queue = []
-        for obj in bake_targets(context):
-            high = None
-            if props.use_highpoly_bake:
-                partner = paintset.find_high(obj, props.highpoly_suffix)
-                if not partner:
-                    self._skipped.append(partner.reason)
-                    self._dropped.append(obj.name)
-                    continue
-                high = partner.object
-            self._queue.append((obj, high))
-
-        self._total = len(self._queue)
+        self._queue_up(context)
         if not self._queue or not self._start_next(context):
             self.report({'ERROR'}, "Nothing to bake. " +
-                        (self._skipped[0] if self._skipped else ""))
+                        _why(self._skipped))
             self._finish(context)
             return {'CANCELLED'}
 
@@ -308,36 +384,20 @@ class PAINTR2_OT_bake_mesh_maps_external(bpy.types.Operator):
         return {'FINISHED'}
 
     def _collect(self, context):
+        """Lay one model's maps into its material's, still unfilled."""
         from .. import external as ext
 
         produced = ext.read_output(self._job.output_path)
-        images = ext.apply_maps(self._current, produced)
-        self._maps += len(images)
+        for identifier, pixels in produced.items():
+            base = self._pending.get(identifier)
+            if base is None or base.shape != pixels.shape:
+                self._pending[identifier] = pixels
+            else:
+                meshmaps.merge_coverage(base, pixels)
         self._job.cleanup()
 
     def _run_blocking(self, context):
-        from .. import external as ext
-
-        self._skipped = []
-        self._dropped = []
-        self._done = 0
-        self._maps = 0
-        self._current = None
-        self._directory = tempfile.mkdtemp(prefix="paintr2_bake_")
-        props = context.scene.paintr2
-
-        self._queue = []
-        for obj in bake_targets(context):
-            high = None
-            if props.use_highpoly_bake:
-                partner = paintset.find_high(obj, props.highpoly_suffix)
-                if not partner:
-                    self._skipped.append(partner.reason)
-                    self._dropped.append(obj.name)
-                    continue
-                high = partner.object
-            self._queue.append((obj, high))
-        self._total = len(self._queue)
+        self._queue_up(context)
 
         while self._start_next(context):
             while not self._job.poll():
@@ -349,9 +409,9 @@ class PAINTR2_OT_bake_mesh_maps_external(bpy.types.Operator):
             self._collect(context)
             self._done += 1
 
-        if self._done == 0:
+        if self._materials == 0:
             self.report({'ERROR'}, "Nothing baked. " +
-                        (self._skipped[0] if self._skipped else ""))
+                        _why(self._skipped))
             self._finish(context)
             return {'CANCELLED'}
 
@@ -361,7 +421,8 @@ class PAINTR2_OT_bake_mesh_maps_external(bpy.types.Operator):
 
     def _report(self, context):
         where = self._job.device if self._job else ""
-        note = f"Baked {self._maps} map(s) for {self._done} model(s)"
+        note = (f"Baked {self._maps} map(s) for {self._materials} material(s), "
+                f"{self._done} model(s)")
         if where:
             note += f" on {where}"
         if self._skipped:
@@ -387,7 +448,7 @@ class PAINTR2_OT_bake_mesh_maps_external(bpy.types.Operator):
 
 
 class PAINTR2_OT_bake_mesh_maps(bpy.types.Operator):
-    """Bake the ticked mesh maps for every selected model
+    """Bake the ticked mesh maps, one set per material of the selected models
 
     Off the model itself, or -- with Highpoly Bake on -- off the matching
     high-poly. A model with no partner is skipped and named in the report; it
@@ -405,7 +466,6 @@ class PAINTR2_OT_bake_mesh_maps(bpy.types.Operator):
 
     def execute(self, context):
         props = context.scene.paintr2
-        objects = bake_targets(context)
 
         wanted = [
             identifier for identifier in meshmaps.MAP_IDS
@@ -423,36 +483,45 @@ class PAINTR2_OT_bake_mesh_maps(bpy.types.Operator):
         skipped = []
         dropped = []
 
+        for name in _no_material(context):
+            _note(skipped, f"{name} has no material to bake through")
+            _note(dropped, name)
+
         # A hidden object is not in the depsgraph, and a ray that lands on
         # nothing bakes a blank map without saying so. The high-polys are in
         # `Paint_high` and the session hides that collection, so every bake
         # goes through here.
         with isolation.suspended(context):
-            for obj in objects:
-                high = None
-                if use_high:
-                    partner = paintset.find_high(obj, props.highpoly_suffix)
-                    if not partner:
-                        skipped.append(partner.reason)
-                        dropped.append(obj.name)
-                        continue
-                    high = partner.object
+            for material, models in bake_groups(context):
+                parts = []
+                for obj in models:
+                    high = None
+                    if use_high:
+                        partner = paintset.find_high(obj, props.highpoly_suffix)
+                        if not partner:
+                            _note(skipped, partner.reason)
+                            _note(dropped, obj.name)
+                            continue
+                        high = partner.object
+                    parts.append(meshmaps.BakePart(
+                        obj, high, occluders(context, obj)))
+                if not parts:
+                    continue
 
-                result = meshmaps.bake_maps(
-                    obj,
+                result = meshmaps.bake_material(
+                    material,
+                    parts,
                     wanted,
                     size=int(props.mesh_map_resolution),
                     margin=props.bake_margin,
                     smooth=props.curvature_smooth,
-                    high=high,
                     options=options,
-                    occluders=occluders(context, obj),
                 )
 
                 if result.error is not None:
                     self.report(
                         {'ERROR'},
-                        f"{obj.name}: mesh map bake failed: {result.error}",
+                        f"{material.name}: mesh map bake failed: {result.error}",
                     )
                     return {'CANCELLED'}
 
@@ -460,20 +529,20 @@ class PAINTR2_OT_bake_mesh_maps(bpy.types.Operator):
                     baked += 1
                     maps += len(result.images)
                 else:
-                    dropped.append(obj.name)
+                    _note(dropped, material.name)
                 for identifier, reason in result.skipped:
-                    skipped.append(
-                        f"{obj.name}: {meshmaps.map_label(identifier)} {reason}"
-                    )
+                    _note(skipped,
+                          f"{material.name}: {meshmaps.map_label(identifier)} "
+                          f"{reason}")
 
         if baked == 0:
             self.report(
                 {'ERROR'},
-                "Nothing baked. " + (skipped[0] if skipped else ""),
+                "Nothing baked. " + _why(skipped),
             )
             return {'CANCELLED'}
 
-        note = f"Baked {maps} map(s) for {baked} model(s)"
+        note = f"Baked {maps} map(s) for {baked} material(s)"
         if skipped:
             note += f"; skipped {len(skipped)} - {skipped[0]}"
 

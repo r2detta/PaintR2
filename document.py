@@ -684,6 +684,16 @@ class PR2_Document(PropertyGroup):
         default=False,
     )
 
+    # Whether a mesh map bake makes this material's maps. Maps are per
+    # material, so this is the one place to say "not this texture set
+    # this time" -- ticked in the Objects / Materials list.
+    bake_enabled: BoolProperty(
+        name="Bake",
+        description="Bake mesh maps for this material. Unticked materials "
+        "keep the maps they have",
+        default=True,
+    )
+
     shader_mode: EnumProperty(
         name="Shader",
         description="How the compiled stack is shown on the model",
@@ -714,9 +724,9 @@ class PR2_Document(PropertyGroup):
     )
 
     # Which baked map the Mesh Map mode shows. A pointer rather than a map
-    # name: the maps belong to the *object* and the wiring only has the
-    # material, so the window resolves it once when the map is picked. Display
-    # only, like the mode itself -- a bake never reads it.
+    # name, so the wiring does not have to rebuild a name to find it -- the
+    # maps are the material's own. Display only, like the mode itself -- a
+    # bake never reads it.
     preview_map: PointerProperty(
         name="Mesh Map",
         description="The baked map the Mesh Map mode puts on the model",

@@ -49,9 +49,15 @@ class PAINTR2_OT_bake_texture(bpy.types.Operator):
             self.report({'ERROR'}, "Select at least one mesh object")
             return {'CANCELLED'}
 
+        groups = _texture_groups(targets)
         if self.active_only:
             active = context.active_object
-            targets = [active] if active in targets else targets[:1]
+            chosen = active if active in targets else targets[0]
+            # The active model's texture sets, with every model that shares
+            # them: baking it alone would write a texture holding only its
+            # half of the UVs.
+            groups = [g for g in groups if chosen in g]
+            targets = groups[0] if groups else [chosen]
 
         total_saved, total_baked, total_channels = 0, 0, 0
         failures = []
@@ -75,13 +81,14 @@ class PAINTR2_OT_bake_texture(bpy.types.Operator):
         # `isolation.suspended` is the old one: a bake reads geometry through
         # the view layer, and a hidden model is not in the depsgraph.
         props = context.scene.paintr2
-        with _progress(context, self._planned_bakes(context, targets)) as step, \
+        with _progress(context, self._planned_bakes(context, groups)) as step, \
                 bake.bake_settings(context.scene, props.bake_margin) as held, \
                 isolation.suspended(context):
-            for obj in targets:
-                report = self._bake_one(context, obj, step, held)
+            for group in groups:
+                report = self._bake_one(context, group, step, held)
                 if isinstance(report, str):
-                    failures.append(f"{obj.name}: {report}")
+                    failures.append(
+                        f"{', '.join(o.name for o in group)}: {report}")
                     continue
                 saved, baked, channels = report
                 total_saved += saved
@@ -115,25 +122,26 @@ class PAINTR2_OT_bake_texture(bpy.types.Operator):
         )
         return {'FINISHED'}
 
-    def _planned_bakes(self, context, targets):
-        """How many (model, channel) bakes this run is about to do.
+    def _planned_bakes(self, context, groups):
+        """How many (group, channel) bakes this run is about to do.
 
         Counted up front because a progress bar needs to know the whole before
-        it can report a part, and the channel list is per model: two models do
+        it can report a part, and the channel list is per group: two models do
         not have to agree on what they carry.
         """
         props = context.scene.paintr2
-        return sum(len(_channels_for(props, obj)) for obj in targets)
+        return sum(len(_channels_for(props, group)) for group in groups)
 
-    def _bake_one(self, context, obj, step=None, settings=None):
-        """Bake one object. `(saved, baked, channels)`, or a message string."""
+    def _bake_one(self, context, group, step=None, settings=None):
+        """Bake one texture group -- the models that share materials, baked
+        together. `(saved, baked, channels)`, or a message string."""
         props = context.scene.paintr2
 
-        materials = bake.paint_materials(obj) if obj is not None else []
+        materials = [m for obj in group for m in bake.paint_materials(obj)]
         if not materials:
             return "no PaintR2 material on it"
 
-        channels = _channels_for(props, obj)
+        channels = _channels_for(props, group)
         if not channels:
             return "no channel is switched on for export"
 
@@ -141,10 +149,10 @@ class PAINTR2_OT_bake_texture(bpy.types.Operator):
 
         def announce(channel, _index):
             if step is not None:
-                step(f"{obj.name} - {doc.channel_label(channel)}")
+                step(f"{group[0].name} - {doc.channel_label(channel)}")
 
         results = bake.bake_channels(
-            obj,
+            group,
             channels,
             size=int(props.export_resolution),
             margin=props.bake_margin,
@@ -216,15 +224,37 @@ class PAINTR2_OT_export_browse(bpy.types.Operator):
         return {'FINISHED'}
 
 
-def _channels_for(props, obj):
-    """The channels to write for `obj`, in CHANNELS order.
+def _texture_groups(models):
+    """The models split into groups that share no material with each other.
 
-    Every channel the object's materials *agree* on: baking a channel one
-    material has and another has not would leave half the slots black.
+    Models that share a material share its texture, so they are baked in one
+    go and their islands land in one image. Sharing is followed through
+    chains: A and B share Body, B and C share Trim -- all three are one group,
+    because B's bake writes both textures.
+    """
+    groups = []
+    for obj in models:
+        own = set(bake.paint_materials(obj))
+        joined = [g for g in groups
+                  if own & {m for o in g for m in bake.paint_materials(o)}]
+        merged = [o for g in joined for o in g] + [obj]
+        groups = [g for g in groups if g not in joined] + [merged]
+    order = {obj: i for i, obj in enumerate(models)}
+    groups = [sorted(g, key=order.get) for g in groups]
+    return sorted(groups, key=lambda g: order[g[0]])
+
+
+def _channels_for(props, models):
+    """The channels to write for one model or a group, in CHANNELS order.
+
+    Every channel their materials *agree* on: baking a channel one material
+    has and another has not would leave half the slots black.
     """
     from .. import document as doc
 
-    materials = bake.paint_materials(obj) if obj is not None else []
+    if not isinstance(models, (list, tuple)):
+        models = [models] if models is not None else []
+    materials = [m for obj in models for m in bake.paint_materials(obj)]
     if not materials:
         return []
 
@@ -290,9 +320,8 @@ def _targets(context):
     rule stands, so this still works on a file nobody has prepared.
 
     One texture set per material, not per object: two objects sharing a
-    material share the texture, which is what sharing a material means. The
-    de-duplication happens naturally -- `bake.paint_materials` returns the
-    same material for both, and the second bake writes the same filename.
+    material share the texture, which is what sharing a material means. They
+    are baked together -- see `_texture_groups`.
     """
     from .. import paintset
 

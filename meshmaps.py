@@ -143,8 +143,10 @@ def map_suffix(identifier):
     return entry[3] if entry else identifier.lower()
 
 
-def map_name(obj, identifier):
-    return f"{obj.name}_{map_suffix(identifier)}"
+def map_name(owner, identifier):
+    """`Body` -> `Body_ao`. The owner is the material the map belongs to; a
+    scratch image of one model's bake is named after the model instead."""
+    return f"{owner.name}_{map_suffix(identifier)}"
 
 
 def needs_high(identifier):
@@ -259,6 +261,33 @@ class MapResult:
         self.images = {}        # identifier -> Image
         self.error = None
         self.skipped = []       # (identifier, reason)
+
+
+class BakePart:
+    """One model's share of a material's maps.
+
+    `high` is its high-poly or None, `occluders` the other surfaces allowed
+    to shadow its AO -- `occluders_for` builds them.
+    """
+
+    def __init__(self, obj, high=None, occluders=()):
+        self.obj = obj
+        self.high = high
+        self.occluders = list(occluders)
+
+
+def materials_of(obj):
+    """The materials a model's maps can be baked through, slot order, once each.
+
+    A slot with no material, or one without nodes, has nowhere to put an
+    image node, so it is no texture set.
+    """
+    out = []
+    for slot in getattr(obj, "material_slots", ()):
+        material = slot.material
+        if material is not None and material.use_nodes and material not in out:
+            out.append(material)
+    return out
 
 
 # --- geometry helpers --------------------------------------------------------
@@ -705,9 +734,50 @@ def _ensure_image(name, size, colorspace, float_buffer=False):
     return image
 
 
+# The material a bake is for, while `material_scope` is open. A map belongs to
+# a material, so only that material's faces may land in it; module state
+# rather than a parameter because it has to reach `_add_targets` through
+# every `_bake_*` function and the scratch bakes inside them.
+_scope = {"material": None, "elsewhere": None}
+
+
+@contextlib.contextmanager
+def material_scope(material):
+    """Bake only `material`'s faces into the target image, for the duration.
+
+    The other slots still need an image node -- Cycles refuses a bake with a
+    material that has no active image -- so they get a throwaway one. Their
+    faces are baked into that and dropped; on a model whose materials each
+    use the whole 0..1 square, letting them through would paint one texture
+    set's islands over another's.
+    """
+    previous = dict(_scope)
+    _scope["material"] = material
+    _scope["elsewhere"] = None
+    try:
+        yield
+    finally:
+        elsewhere = _scope["elsewhere"]
+        if elsewhere is not None and elsewhere.name in bpy.data.images:
+            bpy.data.images.remove(elsewhere)
+        _scope.update(previous)
+
+
+def _elsewhere_image():
+    image = _scope["elsewhere"]
+    if image is None or image.name not in bpy.data.images:
+        image = bpy.data.images.new("PaintR2 Bake Elsewhere", 8, 8)
+        _scope["elsewhere"] = image
+    return image
+
+
 def _add_targets(obj, image):
-    """A selected, active Image Texture in every material slot."""
+    """A selected, active Image Texture in every material slot.
+
+    Inside a `material_scope`, only that material's slots get `image`.
+    """
     added = []
+    only = _scope["material"]
     for slot in obj.material_slots:
         material = slot.material
         if material is None or not material.use_nodes:
@@ -715,7 +785,8 @@ def _add_targets(obj, image):
         tree = material.node_tree
         node = tree.nodes.new('ShaderNodeTexImage')
         node.name = "PaintR2 Map Target"
-        node.image = image
+        node.image = image if only is None or material == only \
+            else _elsewhere_image()
         for other in tree.nodes:
             other.select = False
         node.select = True
@@ -1242,16 +1313,53 @@ def _read(image):
 
 def bake_maps(obj, identifiers, size=1024, margin=8, smooth=1,
               high=None, options=None, occluders=()):
-    """Bake the named maps for `obj`. Returns a MapResult.
+    """Bake the named maps for `obj` on its own, into its active material.
 
-    `occluders` are the other objects allowed to shadow AO -- `occluders_for`
-    builds them. Nothing else in the scene takes part in any bake here: every
-    other object is out of the render for the duration (`render_only`).
+    A shortcut for scripts and tests. The maps are the *material's*, so a
+    second model sharing that material is not in them -- the operators go
+    through `bake_material` with every model that does.
+    """
+    material = None
+    if obj is not None and obj.type == 'MESH':
+        usable = materials_of(obj)
+        material = obj.active_material if obj.active_material in usable \
+            else (usable[0] if usable else None)
+    return bake_material(material, [BakePart(obj, high, occluders)],
+                         identifiers, size=size, margin=margin, smooth=smooth,
+                         options=options)
 
-    `high` is the high-poly to read from, or None for the self-bake this
-    module has always done. It is the caller's job to find it -- `paintset.py`
-    does that, and keeping the lookup out of here is what lets a bake be run
-    on a pair the collections know nothing about.
+
+def merge_coverage(base, layer):
+    """Lay `layer`'s baked texels over `base`, in place. Both (..., 4).
+
+    Coverage is alpha, as `dilate.fill` reads it: a texel one model wrote
+    replaces what is under it, a texel it did not write is left alone. Where
+    two models' UVs overlap the later one wins -- that is a layout the artist
+    chose, and not one a bake can untangle.
+    """
+    covered = layer[..., 3] > 0.5
+    base[covered] = layer[covered]
+    return base
+
+
+def bake_material(material, parts, identifiers, size=1024, margin=8, smooth=1,
+                  options=None):
+    """Bake the named maps of `material`. Returns a MapResult.
+
+    **One map per material, not per model**. Every model in `parts`
+    shares the material, so they share its texture -- each is baked in turn,
+    only its faces of this material, and what each one wrote is laid into
+    the same image. Filling past the islands happens once, at the end, over
+    all of them.
+
+    A part's `occluders` are the other objects allowed to shadow its AO.
+    Nothing else in the scene takes part in any bake here: every other object
+    is out of the render for the duration (`render_only`).
+
+    A part's `high` is the high-poly to read from, or None for the self-bake
+    this module has always done. It is the caller's job to find it --
+    `paintset.py` does that, and keeping the lookup out of here is what lets a
+    bake be run on a pair the collections know nothing about.
 
     Every map that comes out of here is filled edge to edge: the bake's own
     margin, and then `dilate.fill` for everything past it. No map leaves this
@@ -1260,17 +1368,18 @@ def bake_maps(obj, identifiers, size=1024, margin=8, smooth=1,
     result = MapResult()
     options = options or BakeOptions()
 
-    if obj is None or obj.type != 'MESH':
-        result.error = RuntimeError("Select a mesh object")
+    for part in parts:
+        obj = part.obj
+        if obj is None or obj.type != 'MESH':
+            result.error = RuntimeError("Select a mesh object")
+            return result
+        if not obj.data.uv_layers:
+            result.error = RuntimeError(f"{obj.name} has no UV map")
+            return result
+    if material is None or not parts:
+        name = parts[0].obj.name if parts else "the model"
+        result.error = RuntimeError(f"{name} has no material to bake through")
         return result
-    if not obj.data.uv_layers:
-        result.error = RuntimeError(f"{obj.name} has no UV map")
-        return result
-    if high is not None and not obj.material_slots:
-        result.error = RuntimeError(f"{obj.name} has no material to bake through")
-        return result
-
-    reach = bbox_diagonal(high if high is not None else obj) * THICKNESS_REACH
 
     for identifier in identifiers:
         entry = _BY_ID.get(identifier)
@@ -1278,9 +1387,12 @@ def bake_maps(obj, identifiers, size=1024, margin=8, smooth=1,
             result.skipped.append((identifier, "unknown map"))
             continue
 
-        if needs_high(identifier) and high is None:
-            result.skipped.append((identifier, "needs a high-poly"))
-            continue
+        usable = parts
+        if needs_high(identifier):
+            usable = [part for part in parts if part.high is not None]
+            if not usable:
+                result.skipped.append((identifier, "needs a high-poly"))
+                continue
 
         if needs_external(identifier):
             # Cycles has no pass for it. Skipped with a reason rather than
@@ -1289,20 +1401,39 @@ def bake_maps(obj, identifiers, size=1024, margin=8, smooth=1,
             continue
 
         image = _ensure_image(
-            map_name(obj, identifier), size, entry[2], float_buffer=entry[4]
+            map_name(material, identifier), size, entry[2], float_buffer=entry[4]
         )
 
-        participants = [obj, high]
-        if identifier in OCCLUDED_MAPS:
-            participants.extend(occluders)
-
+        merged = None
+        # With more than one model in the image, each bakes at margin 0: its
+        # alpha is then its own islands, and a margin cannot spill over the
+        # next model's. `dilate.fill` gives them all their margin at the end.
+        part_margin = margin if len(usable) == 1 else 0
         try:
-            with render_only(participants):
-                _bake_one(identifier, obj, image, margin, reach, smooth, high,
-                          options)
+            with material_scope(material):
+                for part in usable:
+                    obj, high = part.obj, part.high
+                    reach = bbox_diagonal(high if high is not None else obj) \
+                        * THICKNESS_REACH
+                    participants = [obj, high]
+                    if identifier in OCCLUDED_MAPS:
+                        participants.extend(part.occluders)
+                    with render_only(participants):
+                        _bake_one(identifier, obj, image, part_margin, reach,
+                                  smooth, high, options)
+                    if len(usable) > 1:
+                        # Every bake blanks the image first, so each model's
+                        # share is lifted out before the next one lands.
+                        baked = _read(image)
+                        merged = baked if merged is None \
+                            else merge_coverage(merged, baked)
         except Exception as error:  # noqa: BLE001
             result.error = error
             return result
+
+        if merged is not None:
+            image.pixels.foreach_set(merged.reshape(-1))
+            image.update()
 
         # Past the margin the bake left black with no alpha, and black is what
         # bleeds back across a seam the moment anything filters the texture.
@@ -1312,7 +1443,7 @@ def bake_maps(obj, identifiers, size=1024, margin=8, smooth=1,
 
         storage.adopt_new_image(image)
         result.images[identifier] = image
-        _store(obj, identifier, image)
+        _store(material, identifier, image)
 
     return result
 
@@ -1333,20 +1464,30 @@ def _bake_one(identifier, obj, image, margin, reach, smooth, high, options):
         _bake_height(obj, image, margin, high, options)
 
 
-def _store(obj, identifier, image):
-    maps = getattr(obj, "paintr2_maps", None)
+def _owner(target):
+    """The material whose maps `target` means: a material is itself, a model
+    is its active material -- the texture set being painted."""
+    if isinstance(target, bpy.types.Object):
+        return target.active_material
+    return target
+
+
+def _store(material, identifier, image):
+    maps = getattr(_owner(material), "paintr2_maps", None)
     if maps is not None:
         setattr(maps, identifier.lower(), image)
 
 
-def stored(obj, identifier):
-    """The map already baked for `obj`, or None."""
-    maps = getattr(obj, "paintr2_maps", None)
+def stored(target, identifier):
+    """The map already baked for a material, or a model's active material,
+    or None."""
+    maps = getattr(_owner(target), "paintr2_maps", None)
     return None if maps is None else getattr(maps, identifier.lower(), None)
 
 
 class PR2_MeshMaps(bpy.types.PropertyGroup):
-    """Where an object keeps the maps baked from it.
+    """Where a material keeps the maps baked for it -- one set per texture
+    set, however many models share it.
 
     Pointers, so the images are the .blend's to keep and `storage` writes them
     beside it like any other painted data.
@@ -1367,12 +1508,12 @@ CLASSES = (PR2_MeshMaps,)
 def register():
     for cls in CLASSES:
         bpy.utils.register_class(cls)
-    bpy.types.Object.paintr2_maps = bpy.props.PointerProperty(type=PR2_MeshMaps)
+    bpy.types.Material.paintr2_maps = bpy.props.PointerProperty(type=PR2_MeshMaps)
 
 
 def unregister():
-    if hasattr(bpy.types.Object, "paintr2_maps"):
-        del bpy.types.Object.paintr2_maps
+    if hasattr(bpy.types.Material, "paintr2_maps"):
+        del bpy.types.Material.paintr2_maps
     for cls in reversed(CLASSES):
         try:
             bpy.utils.unregister_class(cls)

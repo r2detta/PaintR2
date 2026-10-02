@@ -245,7 +245,7 @@ class PAINTR2_PT_meshmaps(bpy.types.Panel):
             layout.label(text="No UV map - unwrap first", icon='ERROR')
 
         from ..ops import op_meshmaps
-        count = len(op_meshmaps.bake_targets(context))
+        count = len(op_meshmaps.bake_groups(context))
         if props.mesh_map_backend == 'EXTERNAL' and binary is None:
             layout.label(text="External baker not installed", icon='ERROR')
 
@@ -255,7 +255,7 @@ class PAINTR2_PT_meshmaps(bpy.types.Panel):
             "paintr2.bake_mesh_maps_external" if use_external
             else "paintr2.bake_mesh_maps",
             icon='TEXTURE',
-            text="Bake Mesh Maps" if count <= 1 else f"Bake {count} Models",
+            text="Bake Mesh Maps" if count <= 1 else f"Bake {count} Materials",
         )
 
 
