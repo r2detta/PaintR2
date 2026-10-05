@@ -2,8 +2,8 @@
 """The layer stack data model -- the single source of truth.
 
 A document hangs off a Material (`material.paintr2`) and owns an ordered list
-of layers. Index 0 is the TOP layer, matching how the stack reads on screen
-and how Photoshop/Substance number things; the compiler walks it in reverse.
+of layers. Index 0 is the TOP layer, matching how the stack reads on screen;
+the compiler walks it in reverse.
 
 Groups are folded into that one flat list rather than nested inside each
 other. A GROUP layer owns the layers that follow it with a greater `depth`:

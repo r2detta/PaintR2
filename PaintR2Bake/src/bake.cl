@@ -258,8 +258,7 @@ inline float3 cosine_direction(const float3 n, const float u1, const float u2) {
 // `cos_max = 0` is the whole hemisphere and reproduces `cosine_direction`
 // exactly, which is what keeps the default path unchanged. Two distributions:
 // cosine-weighted, whose density already carries the cosine term so the AO
-// estimate is a plain hit fraction; and uniform, which Substance's baker uses
-// and which reads harder because grazing directions get the same vote.
+// estimate is a plain hit fraction; and uniform, which reads harder because grazing directions get the same vote.
 inline float3 cone_direction(const float3 n, const float u1, const float u2,
                              const float cos_max, const int uniform) {
     const float phi = 6.2831853071795864f * u2;

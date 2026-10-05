@@ -125,9 +125,6 @@ class PR2_FillSettings(PropertyGroup):
         default='MIX',
     )
 
-    # Substance Painter's right-click "unassign". On a mask this is the
-    # difference between painting the region white and painting it black; on a
-    # colour layer it is the difference between filling and cutting a hole.
     mode: EnumProperty(
         name="Mode",
         description="Whether a click adds the fill or takes it away",
@@ -210,8 +207,6 @@ class PR2_FillSettings(PropertyGroup):
         default='FACE',
     )
 
-    # Mesh Fill: Substance Painter's "mesh fill" means the connected part, not
-    # the whole object, so that is the default here too.
     mesh_scope: EnumProperty(
         name="Mesh",
         items=(
@@ -712,15 +707,12 @@ class PR2_SceneProps(PropertyGroup):
     normal_flip_green: BoolProperty(
         name="Flip Green (DirectX)",
         description="Bake the green channel pointing down instead of up. "
-        "OpenGL, Blender and Unity read +Y; DirectX and Unreal read -Y. The "
+        "OpenGL and Blender read +Y; DirectX reads -Y. The "
         "wrong one lights every dent as a bump",
         default=False,
     )
 
     # --- ambient occlusion, the way a bake edicisi asks about it ------------
-    # Substance Painter's AO panel, minus the ones this tracer has no answer
-    # for. Every one of these is a real change to how the rays are fired or
-    # counted, and every one of them is measured in the test suite.
 
     ao_distance: FloatProperty(
         name="Max Occluder Distance",
@@ -764,8 +756,7 @@ class PR2_SceneProps(PropertyGroup):
         items=(
             ('COSINE', "Cosine", "More rays near the surface normal. The "
              "physically weighted answer, and the softer-looking one"),
-            ('UNIFORM', "Uniform", "Rays spread evenly. Harder edges, and "
-             "what Substance Painter defaults to"),
+            ('UNIFORM', "Uniform", "Rays spread evenly. Harder edges"),
         ),
         default='COSINE',
     )

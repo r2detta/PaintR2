@@ -13,9 +13,8 @@ Where it reaches is decided by two things it shares with every other layer:
   leaves the colour alone.
 
 And its position says *how far down*: the compiler walks group by group, so an
-adjustment inside a folder only ever sees that folder's result. That is
-Photoshop's rule and Substance's, and here it costs nothing because
-`_composite` already recurses per group.
+adjustment inside a folder only ever sees that folder's result. It costs
+nothing because `_composite` already recurses per group.
 
 Adding a kind
 -------------

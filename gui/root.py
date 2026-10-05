@@ -662,10 +662,9 @@ class UIRoot(Container):
         self._brush_size_max = 500
 
         # --- the fill strip -------------------------------------------------
-        # Substance Painter's polygon fill, in three tools. They share this
-        # strip because at this level they differ in one thing only -- how far
-        # a click reaches -- and that is the one control that changes with the
-        # tool. The colour swatches are deliberately *not* rebuilt: a fill
+        # Three fill tools share this strip because at this level they differ
+        # in one thing only -- how far a click reaches -- and that is the one
+        # control that changes with the tool. The colour swatches are deliberately *not* rebuilt: a fill
         # paints with the brush's colour, so those three widgets are laid
         # out by both strips and never lose their value when the tool changes.
         self.fill_scope = self.add(
@@ -685,9 +684,6 @@ class UIRoot(Container):
         )
         self.fill_alpha.display = self._format_strength
 
-        # Fill / Erase, joined like the symmetry axes. Painter puts unassign on
-        # the right mouse button, which in a Blender viewport already means
-        # something else, so it is a visible mode here instead of a hidden one.
         self.fill_mode_row = self.add(Row(joined=True, name="fill_mode_row"))
         self.fill_mode_buttons = {}
         for identifier, label, tooltip in (
@@ -2799,8 +2795,8 @@ class UIRoot(Container):
             return True
 
         # Alt-click isolates, wherever on the row it lands: the gesture is
-        # Photoshop's, and it is about the layer rather than about whichever
-        # control happens to be under the pointer. Alt-clicking the mask chip
+        # about the layer rather than about whichever control happens to be
+        # under the pointer. Alt-clicking the mask chip
         # asks for the mask on its own, which is the same sentence about a
         # different thing.
         if alt:

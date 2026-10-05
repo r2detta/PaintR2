@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Filling UV regions of a layer image -- Substance Painter's polygon fill.
+"""Filling UV regions of a layer image.
 
 Three tools, one job. They differ only in *which faces* a click selects:
 

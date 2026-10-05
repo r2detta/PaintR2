@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Effect stacks: filters and generated patterns, stacked inside one layer.
 
-Substance Painter's model, and the reason it is worth having: a layer is not
+A layer is not
 one thing. It is a source with a pile of work done on top of it -- a fill,
 then a contrast, then a blur, then a gradient blended over the lot -- and
 every one of those steps is separately editable, separately switchable, and

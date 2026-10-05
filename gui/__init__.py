@@ -2,7 +2,7 @@
 """PaintR2's self-drawn interface toolkit.
 
 Blender's Python API cannot register a new editor (Space) type, and the layout
-PaintR2 needs -- a Photoshop-style canvas with a layer stack -- does not map
+PaintR2 needs -- a canvas with a layer stack -- does not map
 onto Blender's panel system. So the window borrows an existing editor, covers
 it completely with a `'POST_PIXEL'` draw handler, and a modal operator feeds
 the widget tree events.

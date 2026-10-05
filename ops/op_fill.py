@@ -8,8 +8,7 @@ the colour down.
 
 Held together by `FillStroke`, because a fill is not always one click. Holding
 the button and sweeping the pointer across the model fills every face it
-crosses -- in Substance Painter that is the normal way to use the tool and
-clicking one polygon at a time is the exception -- so the image buffer is read
+crosses, so the image buffer is read
 once when the button goes down, added to on every step, and written back as
 the stroke goes along.
 

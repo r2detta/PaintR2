@@ -8,9 +8,6 @@ can build layer logic in the shader, but a shader mix is not a file you can
 export. PaintR2 joins the two: paint in a stack of layers, take the result out
 as PNG or EXR.
 
-It is not trying to replace Substance Painter. The goal is to finish the jobs
-simple enough that going to Painter for them was never worth the round trip.
-
 ---
 
 > ### ⚠️ Under development

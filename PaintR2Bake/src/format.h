@@ -29,8 +29,8 @@ enum MapBit : uint32_t {
 enum Flag : uint32_t {
     kFlagFlipGreen = 1u << 0,
     // Ambient occlusion sampling. Cosine-weighted is the default because it
-    // is what an unweighted hit fraction *means*; uniform is the option
-    // Substance offers and it reads harder-edged.
+    // is what an unweighted hit fraction *means*; uniform reads
+    // harder-edged.
     kFlagAOUniform = 1u << 1,
     // Skip occluders whose front is turned away from the ray. On open,
     // single-sided geometry -- a shell, a plane with thickness modelled in --
