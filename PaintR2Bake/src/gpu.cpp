@@ -3,10 +3,27 @@
 #include "gpu.h"
 
 #define CL_TARGET_OPENCL_VERSION 120
+#ifdef __APPLE__
+// Apple ships OpenCL 1.2 as a framework, marked deprecated and still there.
+// Its header lives under another name, and every call warns without this.
+#define CL_SILENCE_DEPRECATION
+#include <OpenCL/opencl.h>
+#else
 #include <CL/cl.h>
+#endif
 
 #include <cstring>
 #include <map>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace gpu {
 
@@ -78,6 +95,16 @@ Device::~Device() {
 }
 
 bool Device::open(const char* source, const char* options, std::string& error) {
+#ifdef _WIN32
+    // OpenCL.dll comes with the GPU driver, not with us, and a machine can be
+    // without one. The binary links it delay-loaded (CMakeLists.txt), so it
+    // starts either way; this is what keeps the first OpenCL call from being
+    // a crash on a machine that has none, and turns it into the CPU path.
+    if (!LoadLibraryW(L"OpenCL.dll")) {
+        error = "no OpenCL runtime (OpenCL.dll not found)";
+        return false;
+    }
+#endif
     if (!pick(impl_->platform, impl_->device, is_gpu_)) {
         error = "no OpenCL device";
         return false;

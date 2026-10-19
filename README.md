@@ -137,24 +137,33 @@ Press `F1` or `?` inside PaintR2 for the full list. The common ones:
 | `Ctrl C` / `Ctrl V` | Copy / paste layers |
 | `Ctrl Z` | Undo a fill |
 
+On macOS, `Cmd` works wherever `Ctrl` is listed.
+
 ---
 
 ## About the mesh map baker
 
-Mesh maps can go through an accelerated baker shipped with the add-on
-(`bin/paintr2_bake`), currently built for **Linux x86-64** only.
+Mesh maps can go through an accelerated baker shipped with the add-on, in
+`bin/<platform>/`. The release zip carries it for **Windows x64**, **macOS on
+Apple Silicon** and **Linux x86-64**; the add-on picks the one for your machine.
+It uses your GPU through OpenCL, and your processor when there is no OpenCL
+driver.
 
-On any other platform there is nothing for you to do: the add-on notices and
-quietly falls back to **Cycles**. The maps are still produced, just more slowly.
-The one exception is **Bent Normal**, which only the accelerated baker can
-produce — on the Cycles path it is skipped, and the report says so.
+If there is no baker for your platform, or it cannot be started (an antivirus
+holding it back, for example), the add-on falls back to **Cycles** for you: the
+maps are still produced, just more slowly, and the report says that it
+happened. The one exception is **Bent Normal**, which only the accelerated
+baker can produce — on the Cycles path it is skipped, and the report says so.
 
-The baker's source is under `PaintR2Bake/`, with its own `build.sh`. To build it
-for your platform:
+The baker's source is under `PaintR2Bake/`. On Linux, `build.sh` builds it;
+every platform builds with CMake:
 
 ```bash
-cd PaintR2Bake && ./build.sh
+cmake -S PaintR2Bake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
 ```
+
+The release binaries are built by `.github/workflows/build.yml`.
 
 ---
 

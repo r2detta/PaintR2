@@ -11,6 +11,7 @@ left/center/right split, and anything more elaborate can be added when a
 feature actually needs it.
 """
 
+from . import keymap
 from . import theme
 
 
@@ -43,7 +44,8 @@ class UIEvent:
         self.mouse_y = blender_event.mouse_y - region_y
         self.prev_mouse_x = prev[0] if prev else self.mouse_x
         self.prev_mouse_y = prev[1] if prev else self.mouse_y
-        self.ctrl = blender_event.ctrl
+        # Cmd on a Mac: every ctrl test in the interface reads this.
+        self.ctrl = keymap.command_held(blender_event)
         self.shift = blender_event.shift
         self.alt = blender_event.alt
         self.unicode = blender_event.unicode

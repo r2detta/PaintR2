@@ -153,6 +153,54 @@ def _note(names, name):
         names.append(name)
 
 
+def _bake_with_cycles(context, material, models, wanted, skipped, dropped):
+    """Bake one material's maps with Cycles. Returns (images, error).
+
+    The one place both operators bake through Cycles: the Cycles operator for
+    every material, the external one for a material its baker could not be
+    started for. What to do with an error is the caller's -- the Cycles
+    operator stops, the external one notes it and goes on.
+    """
+    props = context.scene.paintr2
+    parts = []
+    for obj in models:
+        high = None
+        if props.use_highpoly_bake:
+            partner = paintset.find_high(obj, props.highpoly_suffix)
+            if not partner:
+                _note(skipped, partner.reason)
+                _note(dropped, obj.name)
+                continue
+            high = partner.object
+        parts.append(meshmaps.BakePart(obj, high, occluders(context, obj)))
+    if not parts:
+        return {}, None
+
+    # A hidden object is not in the depsgraph, and a ray that lands on
+    # nothing bakes a blank map without saying so. The high-polys are in
+    # `Paint_high` and the session hides that collection, so every bake goes
+    # through here.
+    with isolation.suspended(context):
+        result = meshmaps.bake_material(
+            material,
+            parts,
+            wanted,
+            size=int(props.mesh_map_resolution),
+            margin=props.bake_margin,
+            smooth=props.curvature_smooth,
+            options=meshmaps.BakeOptions.from_scene(context.scene),
+        )
+
+    if result.error is not None:
+        return {}, result.error
+    if not result.images:
+        _note(dropped, material.name)
+    for identifier, reason in result.skipped:
+        _note(skipped,
+              f"{material.name}: {meshmaps.map_label(identifier)} {reason}")
+    return result.images, None
+
+
 class PAINTR2_OT_measure_cage(bpy.types.Operator):
     """Measure the selected pairs and fill in Extrusion and Max Ray Distance
 
@@ -256,6 +304,10 @@ class PAINTR2_OT_bake_mesh_maps_external(bpy.types.Operator):
                 self._flush()
                 self._material = material
 
+            if self._unstartable:
+                self._fall_back(context, material)
+                continue
+
             props = context.scene.paintr2
             options = meshmaps.BakeOptions.from_scene(context.scene)
 
@@ -284,11 +336,48 @@ class PAINTR2_OT_bake_mesh_maps_external(bpy.types.Operator):
                 continue
 
             self._current = obj
-            self._job = ext.Job(ext.available(), path, path[:-5] + ".pr2m")
+            try:
+                self._job = ext.Job(ext.available(), path, path[:-5] + ".pr2m")
+            except OSError as error:
+                # The binary is there and would not start: no OpenCL runtime,
+                # an antivirus holding it, a file that is not for this
+                # machine. It will not start for the next material either, so
+                # the rest of the run is Cycles' -- slower, and a bake rather
+                # than an error.
+                self._job = None
+                self._unstartable = str(error) or type(error).__name__
+                self._fall_back(context, material)
+                continue
             return True
 
         self._flush()
         return False
+
+    def _fall_back(self, context, material):
+        """Bake all of `material` with Cycles, in place of the baker.
+
+        Whole materials, never half of one: the models of this material the
+        baker already did are thrown away and Cycles bakes all of them, so a
+        map is never one backend's on one model and the other's on the next.
+        """
+        rest = [entry for entry in self._queue if entry[0] == material]
+        self._queue = [entry for entry in self._queue if entry[0] != material]
+        self._pending = {}
+        self._done += 1 + len(rest)
+
+        props = context.scene.paintr2
+        wanted = [identifier for identifier in meshmaps.MAP_IDS
+                  if getattr(props, "bake_map_" + identifier.lower(), False)]
+        images, error = _bake_with_cycles(
+            context, material, self._groups.get(material, []), wanted,
+            self._skipped, self._dropped)
+        if error is not None:
+            _note(self._skipped, f"{material.name}: {error}")
+            _note(self._dropped, material.name)
+        if images:
+            self._maps += len(images)
+            self._materials += 1
+            self._with_cycles += 1
 
     def _flush(self):
         """Turn the material collected so far into its images."""
@@ -312,6 +401,9 @@ class PAINTR2_OT_bake_mesh_maps_external(bpy.types.Operator):
         self._material = None
         self._pending = {}
         self._current = None
+        self._unstartable = ""
+        self._with_cycles = 0
+        self._groups = {}
         self._directory = tempfile.mkdtemp(prefix="paintr2_bake_")
 
         for name in _no_material(context):
@@ -320,6 +412,7 @@ class PAINTR2_OT_bake_mesh_maps_external(bpy.types.Operator):
 
         self._queue = []
         for material, models in bake_groups(context):
+            self._groups[material] = models
             for obj in models:
                 high = None
                 if props.use_highpoly_bake:
@@ -341,6 +434,11 @@ class PAINTR2_OT_bake_mesh_maps_external(bpy.types.Operator):
     def invoke(self, context, event):
         self._queue_up(context)
         if not self._queue or not self._start_next(context):
+            if self._materials:
+                # Everything went to Cycles, and is already done.
+                self._report(context)
+                self._finish(context)
+                return {'FINISHED'}
             self.report({'ERROR'}, "Nothing to bake. " +
                         _why(self._skipped))
             self._finish(context)
@@ -420,18 +518,25 @@ class PAINTR2_OT_bake_mesh_maps_external(bpy.types.Operator):
         return {'FINISHED'}
 
     def _report(self, context):
+        kind, note = self._summary()
+        self.report(kind, note)
+
+    def _summary(self):
+        """The closing report as (kind, message)."""
         where = self._job.device if self._job else ""
         note = (f"Baked {self._maps} map(s) for {self._materials} material(s), "
                 f"{self._done} model(s)")
         if where:
             note += f" on {where}"
+        if self._unstartable:
+            note += (f"; {self._with_cycles} material(s) with Cycles - the "
+                     f"external baker would not start: {self._unstartable}")
         if self._skipped:
             note += f"; skipped {len(self._skipped)} - {self._skipped[0]}"
 
         if self._dropped:
-            self.report({'WARNING'}, _dropped_note(self._dropped) + note)
-            return
-        self.report({'INFO'}, note)
+            return {'WARNING'}, _dropped_note(self._dropped) + note
+        return ({'WARNING'} if self._unstartable else {'INFO'}), note
 
     def _finish(self, context):
         if self._job is not None:
@@ -475,9 +580,6 @@ class PAINTR2_OT_bake_mesh_maps(bpy.types.Operator):
             self.report({'ERROR'}, "No mesh map is selected")
             return {'CANCELLED'}
 
-        use_high = props.use_highpoly_bake
-        options = meshmaps.BakeOptions.from_scene(context.scene)
-
         baked = 0
         maps = 0
         skipped = []
@@ -487,53 +589,18 @@ class PAINTR2_OT_bake_mesh_maps(bpy.types.Operator):
             _note(skipped, f"{name} has no material to bake through")
             _note(dropped, name)
 
-        # A hidden object is not in the depsgraph, and a ray that lands on
-        # nothing bakes a blank map without saying so. The high-polys are in
-        # `Paint_high` and the session hides that collection, so every bake
-        # goes through here.
-        with isolation.suspended(context):
-            for material, models in bake_groups(context):
-                parts = []
-                for obj in models:
-                    high = None
-                    if use_high:
-                        partner = paintset.find_high(obj, props.highpoly_suffix)
-                        if not partner:
-                            _note(skipped, partner.reason)
-                            _note(dropped, obj.name)
-                            continue
-                        high = partner.object
-                    parts.append(meshmaps.BakePart(
-                        obj, high, occluders(context, obj)))
-                if not parts:
-                    continue
-
-                result = meshmaps.bake_material(
-                    material,
-                    parts,
-                    wanted,
-                    size=int(props.mesh_map_resolution),
-                    margin=props.bake_margin,
-                    smooth=props.curvature_smooth,
-                    options=options,
+        for material, models in bake_groups(context):
+            images, error = _bake_with_cycles(
+                context, material, models, wanted, skipped, dropped)
+            if error is not None:
+                self.report(
+                    {'ERROR'},
+                    f"{material.name}: mesh map bake failed: {error}",
                 )
-
-                if result.error is not None:
-                    self.report(
-                        {'ERROR'},
-                        f"{material.name}: mesh map bake failed: {result.error}",
-                    )
-                    return {'CANCELLED'}
-
-                if result.images:
-                    baked += 1
-                    maps += len(result.images)
-                else:
-                    _note(dropped, material.name)
-                for identifier, reason in result.skipped:
-                    _note(skipped,
-                          f"{material.name}: {meshmaps.map_label(identifier)} "
-                          f"{reason}")
+                return {'CANCELLED'}
+            if images:
+                baked += 1
+                maps += len(images)
 
         if baked == 0:
             self.report(

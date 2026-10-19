@@ -40,6 +40,16 @@
 #include "format.h"
 #include "gpu.h"
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 using tinybvh::BVH;
 using tinybvh::BVH8_CPU;
 using tinybvh::BVH_GPU;
@@ -117,12 +127,37 @@ struct Scene {
     }
 };
 
+// Paths travel through this program as UTF-8, on every platform.
+//
+// On Windows that is not what `fopen` takes: it reads a `char*` in the ANSI
+// code page, so a user folder like C:\Users\Çağrı\ -- which is where Blender's
+// temp directory is -- cannot be opened at all. The arguments arrive as UTF-16
+// through `wmain`, go UTF-8 for the rest of the program, and are widened again
+// here, at the one place a file is opened.
+std::FILE* open_file(const std::string& path, const char* mode) {
+#ifdef _WIN32
+    auto widen = [](const std::string& text) {
+        const int count = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1,
+                                              nullptr, 0);
+        std::wstring wide(count > 0 ? count : 1, L'\0');
+        if (count > 0) {
+            MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, &wide[0], count);
+        }
+        wide.resize(wcslen(wide.c_str()));
+        return wide;
+    };
+    return _wfopen(widen(path).c_str(), widen(mode).c_str());
+#else
+    return std::fopen(path.c_str(), mode);
+#endif
+}
+
 bool read_all(std::FILE* file, void* into, size_t bytes) {
     return bytes == 0 || std::fread(into, 1, bytes, file) == bytes;
 }
 
-bool load(const char* path, Scene& scene, std::string& error) {
-    std::FILE* file = std::fopen(path, "rb");
+bool load(const std::string& path, Scene& scene, std::string& error) {
+    std::FILE* file = open_file(path, "rb");
     if (!file) {
         error = std::string("cannot open ") + path;
         return false;
@@ -512,10 +547,10 @@ void parallel_rows(uint32_t rows, const Body& body) {
 
 // --- output ------------------------------------------------------------------
 
-bool write_maps(const char* path, uint32_t size,
+bool write_maps(const std::string& path, uint32_t size,
                 const std::vector<std::pair<uint32_t, std::vector<float>>>& maps,
                 std::string& error) {
-    std::FILE* file = std::fopen(path, "wb");
+    std::FILE* file = open_file(path, "wb");
     if (!file) {
         error = std::string("cannot write ") + path;
         return false;
@@ -1214,7 +1249,8 @@ bool trace_gpu(gpu::Device& device, const BVH_GPU& bvh, const Scene& scene,
 
 }  // namespace
 
-int main(int argc, char** argv) {
+static int run(const std::vector<std::string>& argv) {
+    const size_t argc = argv.size();
     if (argc < 3) {
         std::fprintf(stderr,
                      "usage: paintr2_bake input.pr2b output.pr2m [--cpu]\n");
@@ -1224,8 +1260,8 @@ int main(int argc, char** argv) {
     // `--cpu` exists for one reason: comparing the two backends. A GPU result
     // that cannot be checked against anything is not a verified result.
     bool force_cpu = false;
-    for (int i = 3; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--cpu") == 0) force_cpu = true;
+    for (size_t i = 3; i < argc; ++i) {
+        if (argv[i] == "--cpu") force_cpu = true;
     }
 
     std::string error;
@@ -1511,3 +1547,27 @@ int main(int argc, char** argv) {
     std::printf("DONE %u\n", uint32_t(written.size()));
     return 0;
 }
+
+#ifdef _WIN32
+// UTF-16 arguments, so a path with letters outside the ANSI code page arrives
+// whole. MSVC picks `wmain` up by itself; MinGW needs `-municode`.
+int wmain(int argc, wchar_t** argv) {
+    std::vector<std::string> args;
+    for (int i = 0; i < argc; ++i) {
+        const int bytes = WideCharToMultiByte(CP_UTF8, 0, argv[i], -1, nullptr,
+                                              0, nullptr, nullptr);
+        std::string arg(bytes > 0 ? bytes : 1, '\0');
+        if (bytes > 0) {
+            WideCharToMultiByte(CP_UTF8, 0, argv[i], -1, &arg[0], bytes,
+                                nullptr, nullptr);
+        }
+        arg.resize(std::strlen(arg.c_str()));
+        args.push_back(arg);
+    }
+    return run(args);
+}
+#else
+int main(int argc, char** argv) {
+    return run(std::vector<std::string>(argv, argv + argc));
+}
+#endif

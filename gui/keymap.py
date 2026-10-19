@@ -17,6 +17,33 @@ No bpy here, the same as the rest of `gui/`: an action is a name, and the
 owner decides what the name does.
 """
 
+import sys
+
+
+def on_mac():
+    """macOS, where Command does what Ctrl does everywhere else.
+
+    Read on every call rather than once, so a test can stand in for a Mac.
+    """
+    return sys.platform == "darwin"
+
+
+def command_held(event):
+    """Whether the platform's command modifier is down: Ctrl, or Cmd on a Mac.
+
+    The one place that decides it, so that a binding written `ctrl=True` is
+    Cmd+C to a Mac user, the same as in every other program they have -- and
+    Ctrl still works there too, as it does in Blender.
+    """
+    if getattr(event, "ctrl", False):
+        return True
+    return on_mac() and bool(getattr(event, "oskey", False))
+
+
+def ctrl_label():
+    return "Cmd" if on_mac() else "Ctrl"
+
+
 # Where the pointer has to be for a binding to fire.
 #
 #   LAYERS   the layer panel
@@ -53,13 +80,14 @@ class Binding:
         )
 
     def accelerator(self):
-        """The binding as it is written on screen: "Ctrl G", "Shift M"."""
+        """The binding as it is written on screen: "Ctrl G", "Shift M" --
+        "Cmd G" on a Mac."""
         if self.display:
             return self.display
 
         parts = []
         if self.ctrl:
-            parts.append("Ctrl")
+            parts.append(ctrl_label())
         if self.alt:
             parts.append("Alt")
         if self.shift:

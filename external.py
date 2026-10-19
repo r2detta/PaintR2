@@ -79,39 +79,77 @@ _OUTPUT_HEADER = struct.Struct("<8s3I")
 
 BINARY_NAME = "paintr2_bake"
 
+# The platforms a baker is built for, as the folder under `bin/` that holds
+# each one. Anything else -- Windows on ARM, an Intel Mac, Linux on ARM -- has
+# no binary and bakes with Cycles.
+PLATFORMS = ("linux-x64", "windows-x64", "macos-arm64")
 
-def _host_runs_it():
-    """True on the platform the shipped baker is built for: Linux x86-64.
+_ARCHES = {
+    "x86_64": "x64",
+    "amd64": "x64",
+    "arm64": "arm64",
+    "aarch64": "arm64",
+}
 
-    Asked before the file is, because the file being there proves nothing. On
+
+def platform_tag():
+    """This machine's folder under `bin/` ("windows-x64"), or None.
+
+    Asked before any file is, because a file being there proves nothing. On
     Windows `os.access(..., X_OK)` is true for any file that exists, and on
-    macOS the executable bit is restored below -- so a Linux binary looked
-    runnable, the external baker was chosen, and the bake failed starting it
-    instead of falling back to Cycles.
+    macOS the executable bit is restored below -- so when one Linux binary sat
+    in `bin/`, it looked runnable everywhere, the external baker was chosen,
+    and the bake failed starting it instead of falling back to Cycles. One
+    folder per platform means the only binary ever looked at is the one built
+    for the machine asking.
     """
-    return (sys.platform.startswith("linux")
-            and platform.machine().lower() in {"x86_64", "amd64"})
+    if sys.platform.startswith("linux"):
+        system = "linux"
+    elif sys.platform == "win32":
+        system = "windows"
+    elif sys.platform == "darwin":
+        system = "macos"
+    else:
+        return None
+    arch = _ARCHES.get(platform.machine().lower())
+    if arch is None:
+        return None
+    tag = f"{system}-{arch}"
+    return tag if tag in PLATFORMS else None
+
+
+def executable_name(tag):
+    return BINARY_NAME + (".exe" if tag.startswith("windows") else "")
+
+
+def candidates(tag):
+    """Where the baker for `tag` would be, shipped or built, in order.
+
+    `bin/<tag>/` inside the installed extension is what a user gets.
+    `PaintR2Bake/bin/` beside the source tree is what a developer gets without
+    installing anything.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    name = executable_name(tag)
+    shipped = os.path.join(here, "bin", tag, name)
+    if tag != "linux-x64":
+        return (shipped,)
+    # Only for the platform build.sh builds on. A source tree copied to a Mac
+    # carries the Linux binary in PaintR2Bake/bin/ under the same name, and
+    # that is exactly the mistake the folder per platform is there to rule out.
+    return (
+        shipped,
+        os.path.join(os.path.dirname(here), "PaintR2Bake", "bin", name),
+    )
 
 
 def binary_path():
-    """Where the baker would be, shipped or built.
-
-    Two places, in order: `bin/` inside the installed extension, which is what
-    a user gets, and `PaintR2Bake/bin/` beside the source tree, which is what a
-    developer gets without having to install anything.
-    """
-    if not _host_runs_it():
+    """Where this machine's baker is, or None."""
+    tag = platform_tag()
+    if tag is None:
         return None
 
-    here = os.path.dirname(os.path.abspath(__file__))
-    candidates = (
-        os.path.join(here, "bin", BINARY_NAME),
-        # Beside the source tree, so a developer gets the freshly built one
-        # without installing anything.
-        os.path.join(os.path.dirname(here), "PaintR2Bake", "bin", BINARY_NAME),
-    )
-
-    for path in candidates:
+    for path in candidates(tag):
         if not os.path.isfile(path):
             continue
         if not os.access(path, os.X_OK):
@@ -128,6 +166,25 @@ def binary_path():
         return path
 
     return None
+
+
+def popen_options():
+    """Extra `Popen` arguments for this platform.
+
+    On Windows a console program started from a GUI one gets a console window
+    of its own: without CREATE_NO_WINDOW every bake flashes a black window
+    open and shut. The constant only exists in Windows' `subprocess`, hence
+    the literal fallback.
+
+    The baker's output is read as UTF-8 by the callers rather than in the
+    locale's encoding: an error naming a path in C:\\Users\\Çağrı\\ is UTF-8,
+    and Windows' code page would mangle it or stop the reader on a byte it
+    has no letter for.
+    """
+    if sys.platform == "win32":
+        return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW",
+                                         0x08000000)}
+    return {}
 
 
 def available():
@@ -498,7 +555,10 @@ def run(binary, input_path, output_path, on_progress=None):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
+        **popen_options(),
     )
 
     message = ""
@@ -542,6 +602,9 @@ class Job:
     """
 
     def __init__(self, binary, input_path, output_path):
+        """Start the baker. Raises OSError when it cannot be started at all --
+        a missing OpenCL runtime, a binary an antivirus took away -- and the
+        caller falls back to Cycles on that (`ops/op_meshmaps.py`)."""
         self.input_path = input_path
         self.output_path = output_path
         self.progress = 0.0
@@ -553,7 +616,8 @@ class Job:
         self._process = subprocess.Popen(
             [binary, input_path, output_path],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, bufsize=1,
+            text=True, encoding="utf-8", errors="replace", bufsize=1,
+            **popen_options(),
         )
         self._reader = threading.Thread(target=self._drain, daemon=True)
         self._reader.start()

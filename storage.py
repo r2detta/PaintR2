@@ -144,7 +144,7 @@ def _pack_via_temp(image):
     import tempfile
 
     folder = tempfile.mkdtemp(prefix="paintr2_pack_")
-    path = os.path.join(folder, f"{image.name}.png")
+    path = os.path.join(folder, f"{bpy.path.clean_name(image.name)}.png")
     previous_format = image.file_format
     previous_path = image.filepath_raw
 

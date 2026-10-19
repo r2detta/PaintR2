@@ -47,6 +47,7 @@ from . import nodegen
 from . import preferences
 from . import session
 from .gui import icons
+from .gui import keymap
 from .gui import theme
 
 
@@ -4052,11 +4053,11 @@ def _falloff_panel_rows(context, brush):
     # only difference is which mapping the row names.
     for key, label, switch, desc in (
         ("curve_size", "Size Pressure", "use_pressure_size",
-         "How pen pressure maps to brush size - drag a point, Ctrl-click to "
-         "add or remove one"),
+         "How pen pressure maps to brush size - drag a point, "
+         f"{keymap.ctrl_label()}-click to add or remove one"),
         ("curve_strength", "Strength Pressure", "use_pressure_strength",
-         "How pen pressure maps to brush strength - drag a point, Ctrl-click "
-         "to add or remove one"),
+         "How pen pressure maps to brush strength - drag a point, "
+         f"{keymap.ctrl_label()}-click to add or remove one"),
     ):
         on = bool(getattr(brush, switch, False))
         rows.append({
@@ -4122,7 +4123,8 @@ def _curve_row(brush, key="curve_distance_falloff", desc=None):
         "key": key,
         "label": "",
         "desc": desc or
-        "Falloff curve - drag a point, Ctrl-click to add or remove one",
+        "Falloff curve - drag a point, "
+        f"{keymap.ctrl_label()}-click to add or remove one",
         "samples": samples,
         "points": points,
         "selected": selected,

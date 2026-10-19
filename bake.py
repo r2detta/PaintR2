@@ -33,6 +33,7 @@ Measured facts on Blender 5.2:
 
 import contextlib
 import os
+import re
 
 import bpy
 
@@ -1271,13 +1272,30 @@ def cycles_available():
 # --- saving -----------------------------------------------------------------
 
 
+# What no file name may hold on Windows, plus the separators everywhere.
+_UNSAFE_IN_FILE_NAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def file_name(name):
+    """`name` as a file name every platform accepts.
+
+    Only what would fail is replaced. `bpy.path.clean_name` would also turn
+    spaces, dots and every non-ASCII letter into underscores, and an exported
+    texture is a file the user named and goes looking for by that name.
+    Windows refuses `: * ? " < > |` outright and quietly drops a trailing dot
+    or space, which would make two names one file.
+    """
+    cleaned = _UNSAFE_IN_FILE_NAME.sub("_", name).rstrip(". ")
+    return cleaned or "_"
+
+
 def save_image(image, directory, file_format='PNG'):
     """Write `image` into `directory`, returning the absolute path."""
     directory = bpy.path.abspath(directory)
     os.makedirs(directory, exist_ok=True)
 
     extension = FILE_FORMATS.get(file_format, ".png")
-    path = os.path.join(directory, image.name + extension)
+    path = os.path.join(directory, file_name(image.name) + extension)
 
     image.filepath_raw = path
     image.file_format = file_format
