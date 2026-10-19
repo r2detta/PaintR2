@@ -84,7 +84,7 @@ class PR2_UIState(PropertyGroup):
         name="Left Panel",
         items=(
             ('DISPLAY', "Display", "Lighting and shader mode"),
-            ('BAKE', "Bake", "Mesh maps and export"),
+            ('BAKE', "Bake", "Mesh maps and layer images"),
         ),
         default='DISPLAY',
     )
@@ -441,6 +441,20 @@ class PR2_SceneProps(PropertyGroup):
         name="Session Was Open",
         description="Whether a PaintR2 window was open when this file was saved",
         default=False,
+    )
+
+    # Where the window was when PaintR2 took it over. Also on the session, but
+    # a file saved mid-session opens on the PaintR2 workspace with no session
+    # behind it, and this is how it finds its way back.
+    return_workspace: StringProperty(
+        name="Return Workspace",
+        description="The workspace PaintR2 was opened from",
+        default="",
+    )
+    return_mode: StringProperty(
+        name="Return Mode",
+        description="The object mode PaintR2 was opened from",
+        default="",
     )
 
     canvas_zoom: FloatProperty(

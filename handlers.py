@@ -41,6 +41,10 @@ def _on_load_post(*_args):
     if scene is not None and hasattr(scene, "paintr2"):
         scene.paintr2.session_was_open = False
 
+    # And it opens on the PaintR2 workspace, with no session behind it. The
+    # window goes back to the workspace the session came from.
+    window_mod.cleanup_stale_workspaces()
+
     # And a file saved mid-session opens with half the scene hidden and no
     # window to say why. The record of what was hidden is on the scene for
     # exactly this: there is no session here, so there is nothing for

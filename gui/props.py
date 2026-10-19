@@ -56,7 +56,7 @@ import time
 from . import draw
 from . import icons
 from . import theme
-from .colorpicker import ColorSwatch
+from .colorpicker import ColorSwatch, display_color
 from .widget import Widget
 from .widgets import Menu, TextField
 
@@ -738,7 +738,8 @@ class PropertyPanel(Widget):
         if len(colour) == 3:
             colour = colour + (1.0,)
         radius = theme.radius(height, self.ui_scale)
-        draw.rounded_rect(x, y, width, height, radius, colour)
+        draw.rounded_rect(x, y, width, height, radius,
+                          display_color(colour, row.get("gamma", False)))
         draw.rounded_rect_outline(x, y, width, height, radius, theme.OUTLINE)
 
     def _draw_suffix(self, spec, rect, active):
@@ -1117,6 +1118,7 @@ class PropertyPanel(Widget):
             colour = colour + (1.0,)
         self._edit = (row.get("owner"), row.get("key"), row)
         self.swatch.color = colour
+        self.swatch.gamma = bool(row.get("gamma", False))
         self.swatch.set_rect(*rect)
         if self.swatch.picker is not None:
             self.swatch.picker.open_for(self.swatch, over=self._overlay_root())

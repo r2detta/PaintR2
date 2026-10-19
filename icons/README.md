@@ -30,7 +30,13 @@ effects        eye_closed     eye_open       fill_bucket    folder
 gradient       mask_square    mesh_fill      mirror         nodes
 plus           polygon_fill   pressure       select_box     select_lasso
 stroke         swap           trash          uv_island_fill wireframe
+layer_adjust   layer_delete   layer_fill     layer_filter   layer_group
+layer_mask     layer_paint    layer_pattern
 ```
+
+The `layer_*` names are the Layers panel's own set, kept apart from the brush
+strip: replacing `layer_fill` changes the Layers toolbar and leaves the
+strip's `fill_bucket` as it is.
 
 A PNG matching none of these is ignored.
 

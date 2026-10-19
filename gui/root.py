@@ -47,7 +47,7 @@ from . import draw
 from . import theme
 from . import icons
 from . import keymap
-from .colorpicker import ColorPicker, ColorSwatch
+from .colorpicker import ColorPicker, ColorSwatch, display_color
 from .dialog import Dialog
 from .props import Popover, PropertyPanel
 from .widget import Container
@@ -57,6 +57,8 @@ from .widgets import (
     Dropdown,
     Slider,
     IconButton,
+    LayerIconButton,
+    LayerToolbar,
     Label,
     ListView,
     Menu,
@@ -97,10 +99,10 @@ class UIRoot(Container):
     ROW_GAP = theme.LIST_ROW_GAP
     # An eye, not a checkbox, so it wants the room an icon needs to read.
     TOGGLE_SIZE = 16
-    CHIP_SIZE = 20
-    OPACITY_WIDTH = 40
+    CHIP_SIZE = theme.LAYER_CHIP
+    OPACITY_WIDTH = theme.LAYER_OPACITY_WIDTH
     BLEND_WIDTH = 78
-    CONTROL_HEIGHT = 20
+    CONTROL_HEIGHT = theme.LAYER_CONTROL_HEIGHT
     # How little room the name may be left with before a right-hand control
     # is dropped instead. Blend goes first, opacity second: the blend mode is
     # the wider of the two and the rarer to be changed, and a layer whose name
@@ -137,9 +139,9 @@ class UIRoot(Container):
     # one thing any more -- a ramp and a group of hand-built nodes have
     # nothing in common to draw.
     TYPE_ICONS = {
-        'PROCEDURAL': icons.gradient,
-        'GROUP': icons.folder,
-        'ADJUSTMENT': icons.adjustment,
+        'PROCEDURAL': icons.layer_pattern,
+        'GROUP': icons.layer_group,
+        'ADJUSTMENT': icons.layer_adjust,
     }
     KIND_ICONS = {
         'CUSTOM': icons.nodes,
@@ -147,9 +149,9 @@ class UIRoot(Container):
     # What an effect row draws in its chip. A filter is the fallback, because
     # it is the only one of the three that is not a thing of its own.
     EFFECT_ICONS = {
-        'PATTERN': icons.gradient,
-        'PAINT': icons.brush,
-        'FILTER': icons.adjustment,
+        'PATTERN': icons.layer_pattern,
+        'PAINT': icons.layer_paint,
+        'FILTER': icons.layer_filter,
     }
 
     # One level of nesting, and the disclosure triangle that opens a group.
@@ -173,6 +175,9 @@ class UIRoot(Container):
 
     # "Display", beside it. Narrower because the word is.
     DISPLAY_BUTTON = 66
+
+    # "Export", between Close and the graph toggle.
+    EXPORT_BUTTON = 66
 
     # Mirroring axes, in the order Blender lists them.
     SYMMETRY_AXES = ('X', 'Y', 'Z')
@@ -430,6 +435,15 @@ class UIRoot(Container):
         )
         self.close_button.tooltip = "Close the PaintR2 window"
 
+        # Export is its own menu, not a block inside Bake: baking reads maps
+        # off the model, exporting writes the painted layers out, and the two
+        # share nothing but the word. A plain button rather than a toggle --
+        # what it opens is the export dialog, which closes itself.
+        self.export_button = self.add(
+            Button("Export", self._on_export_clicked, name="export")
+        )
+        self.export_button.tooltip = "Choose what to bake and where to write it"
+
         # The one piece of Blender's own interface this window ever shows, and
         # it is not shown *inside* our region -- it gets an editor of its own
         # beside us (the rule is about our region, not about the window). A shader
@@ -464,7 +478,7 @@ class UIRoot(Container):
             ToggleButton(
                 "Bake",
                 on_toggle=self._on_bake_toggled,
-                tooltip="Mesh maps and export",
+                tooltip="Mesh maps and layer images",
                 name="bake_toggle",
             )
         )
@@ -794,23 +808,26 @@ class UIRoot(Container):
         self.targets.add(self.material_list, height=None)
         self._material_list_index = len(self.targets.child_heights) - 1
 
-        self.layers = self.add(Panel("Layers", 'BG_PANEL', "layers"))
+        self.layers = self.add(Panel("Layers", 'MENU_BACK', "layers"))
+
+        self.layers.padding = theme.LAYER_PANEL_PAD
+        self.layers.gap = theme.LAYER_PANEL_GAP
 
         # Creating things at the top, acting on the order at the bottom. Fixed
         # width, so a fourth button (a node layer, say) will not shrink the
         # ones already there.
-        create_row = Row(item_width=self.ICON_BUTTON, name="create_buttons")
+        create_row = LayerToolbar(item_width=theme.LAYER_BUTTON, name="create_buttons")
         create_row.add(
-            IconButton(
-                icons.fill_bucket,
+            LayerIconButton(
+                icons.layer_fill,
                 lambda _b: self._emit(self.on_layer_add, 'FILL'),
                 "Add a fill layer",
                 name="add_fill",
             )
         )
         create_row.add(
-            IconButton(
-                icons.brush,
+            LayerIconButton(
+                icons.layer_paint,
                 lambda _b: self._emit(self.on_layer_add, 'PAINT'),
                 "Add a paint layer",
                 name="add_paint",
@@ -820,16 +837,16 @@ class UIRoot(Container):
         # which member is being added is a choice, not a default with the rest
         # hidden behind a preference.
         self.procedural_button = create_row.add(
-            IconButton(
-                icons.gradient,
+            LayerIconButton(
+                icons.layer_pattern,
                 self._on_procedural_clicked,
                 "Add a procedural layer",
                 name="add_procedural",
             )
         )
         self.adjustment_button = create_row.add(
-            IconButton(
-                icons.adjustment,
+            LayerIconButton(
+                icons.layer_adjust,
                 self._on_adjustment_clicked,
                 "Add an adjustment layer",
                 name="add_adjustment",
@@ -840,8 +857,8 @@ class UIRoot(Container):
         # "make a group out of these" are the same intent and the selection
         # already says which one is meant.
         self.group_button = create_row.add(
-            IconButton(
-                icons.folder,
+            LayerIconButton(
+                icons.layer_group,
                 self._on_group_clicked,
                 "Add a group",
                 name="add_group",
@@ -852,8 +869,8 @@ class UIRoot(Container):
         # is already there, and a menu is the only honest shape for it: there
         # are seven filters and four patterns.
         self.effect_button = create_row.add(
-            IconButton(
-                icons.effects,
+            LayerIconButton(
+                icons.layer_filter,
                 self._on_effect_clicked,
                 "Add a filter to this layer, or to its mask",
                 name="add_effect",
@@ -861,8 +878,8 @@ class UIRoot(Container):
         )
 
         self.mask_button = create_row.add(
-            IconButton(
-                icons.mask_square,
+            LayerIconButton(
+                icons.layer_mask,
                 self._on_mask_clicked,
                 "Mask options for the active layer",
                 name="mask",
@@ -874,17 +891,18 @@ class UIRoot(Container):
         # action cannot be hit by a hand aiming at the one beside it.
         create_row.add(Spacer(name="create_gap"))
         self.delete_button = create_row.add(
-            IconButton(
-                icons.trash,
+            LayerIconButton(
+                icons.layer_delete,
                 self._on_delete_clicked,
                 "Delete  (X)",
                 name="delete_layer",
             )
         )
         self.create_row = create_row
-        self.layers.add(create_row, height=self.ICON_BUTTON)
+        self.layers.add(create_row, height=theme.LAYER_BUTTON)
 
         self.layer_list = ListView(row_height=self.ROW_HEIGHT, name="layer_list")
+        self.layer_list.background = "MENU_BACK"
         self.layer_list.empty_text = "No layers"
         self.layer_list.draw_row = self._draw_layer_row
         self.layer_list.on_activate = self._on_layer_activate
@@ -916,7 +934,7 @@ class UIRoot(Container):
 
         order_row = Row(item_width=self.ICON_BUTTON, name="order_buttons")
         order_row.add(
-            IconButton(
+            LayerIconButton(
                 icons.arrow_up,
                 lambda _b: self._emit(self.on_layer_move, 'UP'),
                 "Move the active layer up",
@@ -924,7 +942,7 @@ class UIRoot(Container):
             )
         )
         order_row.add(
-            IconButton(
+            LayerIconButton(
                 icons.arrow_down,
                 lambda _b: self._emit(self.on_layer_move, 'DOWN'),
                 "Move the active layer down",
@@ -1045,6 +1063,9 @@ class UIRoot(Container):
     def _on_close_clicked(self, _button):
         self._emit(self.on_close)
 
+    def _on_export_clicked(self, _button):
+        self.open_export_dialog()
+
     def _on_mask_clicked(self, button):
         """Mask options for the active layer, as a menu.
 
@@ -1111,13 +1132,6 @@ class UIRoot(Container):
         self._emit(self.on_display_prop, owner, key, value)
 
     def _on_display_action(self, action, *args):
-        # The one action in this panel that asks before it acts. Everything a
-        # bake is about -- the folder, the size, the format, the channels --
-        # used to live in a collapsed sub-panel the button did not mention,
-        # and pressing it wrote six files somewhere without saying so.
-        if action == 'bake_export':
-            self.open_export_dialog()
-            return
         self._emit(self.on_display_action, action, *args)
 
     def open_export_dialog(self):
@@ -2110,7 +2124,7 @@ class UIRoot(Container):
         if colour is not None:
             draw.rounded_rect(
                 chip_x, y + (height - chip) // 2, chip, chip,
-                theme.radius(chip, self._ui_scale), tuple(colour),
+                theme.radius(chip, self._ui_scale), display_color(colour),
             )
             draw.rounded_rect_outline(
                 chip_x, y + (height - chip) // 2, chip, chip,
@@ -2361,24 +2375,27 @@ class UIRoot(Container):
         return zones
 
     def _draw_layer_row(self, item, index, x, y, width, height, active, hovered):
-        # Only selection and hover are painted, as a rounded inset -- the way
-        # Blender draws a list. Rows with a background of their own would
-        # square off the corners of the box they sit in, and a separator line
-        # under each one is not something Blender's lists have either.
+        zones = self._row_zones(x, y, width, height, item)
+        if item.get("type") == 'EFFECT':
+            self._draw_effect_row(item, zones, x, y, width, height, active)
+            return
+
         inset = self.px(theme.LIST_INSET)
-        radius = theme.radius(height, self._ui_scale)
-        if active:
-            draw.rounded_rect(x + inset, y, width - inset * 2, height, radius,
-                              theme.LIST_SEL)
-        elif item.get("selected"):
-            # Selected but not the active one: the same colour, half strength.
-            # One row has to read as "this is the one being edited", so the
-            # others cannot use the full selection colour.
-            draw.rounded_rect(x + inset, y, width - inset * 2, height, radius,
-                              theme.LIST_SEL[:3] + (theme.LIST_SEL[3] * 0.45,))
+        row_inset = self.px(theme.LAYER_ROW_INSET_Y)
+        radius = min(theme.radius(height, self._ui_scale), self.px(theme.LAYER_RADIUS))
+        selected = active or item.get("selected")
+        face = theme.BG_PANEL
+        edge = theme.MENU_OUTLINE
+        if selected:
+            face = theme._mix(face, theme.ACCENT, 0.18 if active else 0.09)
+            edge = theme.ACCENT if active else theme._mix(theme.OUTLINE, theme.ACCENT, 0.4)
         elif hovered:
-            draw.rounded_rect(x + inset, y, width - inset * 2, height, radius,
-                              theme.LIST_HOVER)
+            face = theme._mix(face, theme.WIDGET_TEXT, 0.06)
+            edge = theme.OUTLINE
+        draw.rounded_rect(x + inset, y + row_inset, width - inset * 2,
+                          height - row_inset * 2, radius, face)
+        draw.rounded_rect_outline(x + inset, y + row_inset, width - inset * 2,
+                                  height - row_inset * 2, radius, edge)
 
         # A solo is a state the whole list is in, not a mark on one row: the
         # row being looked at keeps its colour and every other one goes quiet,
@@ -2401,15 +2418,6 @@ class UIRoot(Container):
             strip = self.px(theme.LIST_TAG_WIDTH)
             draw.rect(x + inset, y + self.px(2), strip,
                       height - self.px(4), tag)
-
-        zones = self._row_zones(x, y, width, height, item)
-
-        if item.get("type") == 'EFFECT':
-            # Before the layer chrome rather than after it: an effect row
-            # draws a recessed strip over the whole row, and anything drawn
-            # first would only be painted over.
-            self._draw_effect_row(item, zones, x, y, width, height, active)
-            return
 
         # The tree lines. Indent alone says how deep a row is but not what it
         # is under: with two groups open, a child three rows below its header
@@ -2455,7 +2463,7 @@ class UIRoot(Container):
         type_icon = self.KIND_ICONS.get(item.get("kind")) or \
             self.TYPE_ICONS.get(item.get("type"))
         if item.get("color") is not None:
-            draw.rect(cx, cy, chip, chip, item["color"])
+            draw.rect(cx, cy, chip, chip, display_color(item["color"]))
         elif type_icon is not None:
             # A generated layer has no pixels to show, so the chip says what
             # kind of thing it is instead. That is also why there is no
@@ -2491,7 +2499,7 @@ class UIRoot(Container):
         if not item["visible"]:
             name_color = theme.WIDGET_TEXT_DIM
         elif active:
-            name_color = theme.WIDGET_TEXT_SEL
+            name_color = theme.WIDGET_TEXT
         else:
             name_color = theme.WIDGET_TEXT
         draw.text_elided(
@@ -2555,14 +2563,18 @@ class UIRoot(Container):
         # 6 px from the *owner's* indent, which put it to the left of the
         # owner's eye and made the filter look like the next layer down.
         left = x + pad + indent * depth
-        strip_y = y + self.px(1)
-        strip_h = max(1, height - self.px(2))
-        radius = theme.radius(strip_h, self._ui_scale)
+        strip_y = y + self.px(theme.LAYER_ROW_INSET_Y)
+        strip_h = max(1, height - self.px(theme.LAYER_ROW_INSET_Y) * 2)
+        radius = min(theme.radius(strip_h, self._ui_scale), self.px(theme.LAYER_RADIUS))
         selected = bool(active or item.get("active_effect"))
         draw.rounded_rect(
             left, strip_y, max(0, x + width - inset - left), strip_h, radius,
-            theme.LIST_SEL if selected else theme.BOX_INNER,
+            theme._mix(theme.BG_PANEL, theme.ACCENT, 0.18) if selected else theme.BG_PANEL,
         )
+        if selected:
+            draw.rounded_rect_outline(
+                left, strip_y, max(0, x + width - inset - left), strip_h, radius, theme.ACCENT,
+            )
 
         # The elbow: down the parent's line, then across into the strip.
         thickness = max(1, self.px(1))
@@ -2589,7 +2601,7 @@ class UIRoot(Container):
             item.get("effect_type"), icons.adjustment
         )
         glyph(cx, cy, small,
-              theme.WIDGET_TEXT_SEL if selected else theme.WIDGET_TEXT_DIM)
+              theme.WIDGET_TEXT if selected else theme.WIDGET_TEXT_DIM)
 
         name_x, _, name_width, _ = zones['NAME']
         size = self.px(theme.FONT_SIZE_SMALL)
@@ -2598,7 +2610,7 @@ class UIRoot(Container):
         if not item["visible"]:
             name_color = theme.WIDGET_TEXT_DIM
         elif selected:
-            name_color = theme.WIDGET_TEXT_SEL
+            name_color = theme.WIDGET_TEXT
         else:
             name_color = theme.WIDGET_TEXT
         draw.text_elided(
@@ -2612,28 +2624,25 @@ class UIRoot(Container):
             self._draw_blend_chip(zones['BLEND'], item.get("blend", 'MIX'))
 
     def _draw_opacity_chip(self, rect, opacity):
-        """The opacity readout: a bar you drag sideways, not a label.
-
-        Full opacity draws no bar at all. Every layer starting out at 100%
-        meant a column of identical blue blocks, which said nothing; an empty
-        chip makes the layers that *are* turned down the ones that stand out.
-        """
+        """Draggable percentage with a fine meter for reduced opacity."""
         x, y, width, height = rect
-        radius = theme.radius(height, self._ui_scale)
+        radius = min(theme.radius(height, self._ui_scale), self.px(theme.LAYER_RADIUS))
 
-        draw.widget(x, y, width, height, radius, theme.WIDGET,
+        draw.widget(x, y, width, height, radius, theme.MENU_BACK,
                     outline=theme.OUTLINE, emboss=theme.EMBOSS)
 
-        filled = int(width * min(1.0, max(0.0, opacity)))
-        if 0 < filled < width:
-            draw.rounded_rect(x, y, filled, height, radius, theme.METER,
-                              corners=draw.CORNER_LEFT)
+        if opacity < 1.0:
+            meter_pad = self.px(6)
+            meter_width = max(0, width - meter_pad * 2)
+            draw.rect(x + meter_pad, y + self.px(3), meter_width, self.px(2), theme.OUTLINE)
+            draw.rect(x + meter_pad, y + self.px(3),
+                      meter_width * min(1.0, max(0.0, opacity)), self.px(2), theme.ACCENT)
 
         size = self.px(theme.FONT_SIZE_SMALL)
         draw.text_centered(
             x + width * 0.5,
             y + height * 0.5,
-            f"{opacity * 100:.0f}",
+            f"{opacity * 100:.0f}%",
             size,
             theme.WIDGET_TEXT,
         )
@@ -2642,9 +2651,9 @@ class UIRoot(Container):
         """The blend mode, on the row, as a dropdown that opens in place."""
         x, y, width, height = rect
         pad = self.px(5)
-        radius = theme.radius(height, self._ui_scale)
+        radius = min(theme.radius(height, self._ui_scale), self.px(theme.LAYER_RADIUS))
 
-        draw.widget(x, y, width, height, radius, theme.WIDGET,
+        draw.widget(x, y, width, height, radius, theme.MENU_BACK,
                     outline=theme.OUTLINE, emboss=theme.EMBOSS)
 
         mark = self.px(9)
@@ -2670,7 +2679,7 @@ class UIRoot(Container):
 
     def _draw_type_chip(self, x, y, size, icon):
         """A chip that carries an icon rather than pixels."""
-        draw.rect(x, y, size, size, theme.WIDGET)
+        draw.rounded_rect(x, y, size, size, self.px(3), theme.MENU_BACK)
         inset = max(1, size // 6)
         icon(x + inset, y + inset, size - inset * 2, theme.WIDGET_TEXT)
 
@@ -2684,7 +2693,7 @@ class UIRoot(Container):
             draw.image_rect(x, y, size, size, texture)
 
     def _chip_border(self, x, y, size, selected):
-        colour = theme.WIDGET_TEXT if selected else theme.OUTLINE
+        colour = theme.ACCENT if selected else theme.OUTLINE
         draw.rounded_rect_outline(
             x, y, size, size, self.px(2), colour, max(1.0, self.px(2 if selected else 1))
         )
@@ -3503,16 +3512,19 @@ class UIRoot(Container):
         self.title.set_rect(pad, top, title_w, header_h)
         self.status_label.set_rect(pad + title_w + gap, top, status_w, header_h)
 
-        # --- right: Display, Shader Graph, then Close ---
+        # --- right: Bake, Display, Shader Graph, Export, then Close ---
         # Close stays hard against the corner, where it has always been; the
-        # other two go beside it because they are the controls that change
+        # others go beside it because they are the controls that change
         # what the *window* is rather than what the document is.
         graph_w = self.px(self.GRAPH_BUTTON)
         display_w = self.px(self.DISPLAY_BUTTON)
+        export_w = self.px(self.EXPORT_BUTTON)
         cursor = self.width - pad
 
         cursor -= close_w
         self.close_button.set_rect(cursor, button_y, close_w, button_h)
+        cursor -= gap + export_w
+        self.export_button.set_rect(cursor, button_y, export_w, button_h)
         cursor -= gap + graph_w
         self.graph_button.set_rect(cursor, button_y, graph_w, button_h)
         cursor -= gap + display_w
@@ -3597,6 +3609,8 @@ class UIRoot(Container):
                     column_x, band_y + band_h - targets_h, layers_w, targets_h
                 )
 
+            inner_width = layers_w - self.px(self.layers.padding) * 2
+            self.layers.child_heights[0] = self.create_row.height_for(inner_width) / max(self._ui_scale, 0.01)
             self.layers.set_rect(
                 column_x, band_y, layers_w, max(0, band_h - targets_h)
             )

@@ -151,18 +151,35 @@ PAD = 8
 GAP = 4
 BUTTON_HEIGHT = 22
 
+# Colour picker: roomy field, horizontal hue rail and separate numeric inputs.
+PICKER_WIDTH = 264
+PICKER_PAD = 14
+PICKER_HEADER_HEIGHT = 26
+PICKER_FIELD_HEIGHT = 156
+PICKER_HUE_HEIGHT = 12
+PICKER_CHANNEL_HEIGHT = 24
+PICKER_GAP = 10
+
 # --- the layer list ---------------------------------------------------------
 # Its own numbers rather than borrowed PAD/GAP: a list row carries six controls
 # side by side and needs more room between them than a panel needs at its edge.
-# A row is deliberately taller than a widget unit -- it holds two 16px chips and
-# a name, and at 28 they sat shoulder to shoulder with nothing to separate them.
+# A row leaves breathing room around 24px previews and numeric controls,
+# with a small vertical gap between the rounded cards.
 
-LIST_ROW = 34
+LIST_ROW = 42
 LIST_ROW_PAD = 8
 LIST_ROW_GAP = 6
+LAYER_PANEL_PAD = 12
+LAYER_PANEL_GAP = 10
+LAYER_BUTTON = 28
+LAYER_RADIUS = 6
+LAYER_ROW_INSET_Y = 3
+LAYER_CHIP = 24
+LAYER_CONTROL_HEIGHT = 24
+LAYER_OPACITY_WIDTH = 44
 # Between the layer's own chip and its mask chip: they are a pair, so they sit
 # closer to each other than to anything else.
-LIST_CHIP_GAP = 3
+LIST_CHIP_GAP = 4
 # The inset the selection highlight is drawn with, left and right.
 LIST_INSET = 2
 

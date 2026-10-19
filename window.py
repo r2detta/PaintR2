@@ -1,29 +1,23 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Opening, dressing and tearing down the dedicated PaintR2 window.
+"""Opening, dressing and tearing down the PaintR2 workspace.
 
 Why it works this way
 ---------------------
 Blender's Python API cannot register a new editor type, and there is no
-"blank window" to ask for. Two operators come close:
+"blank window" to ask for. PaintR2 used to open a second top-level window
+(`wm.window_new_main`) and strip it down. Closing that window left the focus
+to the compositor, and on GNOME it went to whichever application had been used
+last rather than back to Blender -- with no API to ask for it back.
 
-* `wm.window_new` pops the active area into a window with no topbar at all --
-  visually perfect, but the result is a *child/temp* window (`window.parent`
-  is set, its screen is named "temp"). The OS treats it as a utility window:
-  no maximize button, odd title-bar dragging, and pop-up menus opened inside
-  it can close it outright.
-* `wm.window_new_main` gives a real, independent top-level window. It clones
-  the whole workspace layout, so the extra editors have to be closed, and
-  Blender's topbar and status bar strips stay visible. In exchange the window
-  behaves like every other window on the desktop.
+So PaintR2 now takes over the window it is opened from. The window is:
 
-PaintR2 uses `window_new_main`. The window is then:
+    1. switched to a workspace of PaintR2's own, appended from
+       `data/workspace.blend` -- one layout, a single 3D Viewport,
+    2. stripped of the regions, gizmos and overlays that would show through,
+    3. given a 'POST_PIXEL' draw handler that paints PaintR2's panels on top,
 
-    1. reduced to a single area,
-    2. switched to a 3D Viewport,
-    3. stripped of the regions, gizmos and overlays that would show through --
-       but NOT of the tool header or the asset shelf, which are Blender's
-       brush strip and brush picker and are kept as they are,
-    4. given a 'POST_PIXEL' draw handler that paints PaintR2's panels on top.
+and on close switched back to the workspace it was on, in the object mode it
+was in, with the PaintR2 workspace removed.
 
 The panels do not cover the middle of the area, so the live viewport shows
 through there -- that is the canvas. Painting, navigation and selection are
@@ -33,8 +27,9 @@ around them.
 The modal operator in ops/op_modal.py routes events: over a panel it consumes
 them, over the viewport it passes them straight through to Blender.
 
-Teardown has to survive the user closing the window with the OS button, which
-gives us no callback -- hence the watchdog timer.
+Teardown has to survive the user leaving without Close -- a click on another
+workspace tab, or the window closing -- neither of which calls us back; hence
+the watchdog timer.
 """
 
 import math
@@ -2512,13 +2507,6 @@ def _display_rows(context):
             },
             {
                 "kind": 'panel',
-                "key": "bake_export",
-                "label": "Export",
-                "open": False,
-                "rows": _export_rows(context),
-            },
-            {
-                "kind": 'panel',
                 "key": "bake_storage",
                 "label": "Layer Images",
                 "open": False,
@@ -2549,41 +2537,6 @@ def _display_rows(context):
             "rows": _scene_rows(context),
         },
     ]
-
-
-def _export_rows(context):
-    """The Export block: the same bake the sidebar runs, from in here."""
-    from . import bake as bake_mod
-
-    scene = getattr(context, "scene", None)
-    if scene is None:
-        return []
-
-    props = scene.paintr2
-    obj = getattr(context, "active_object", None)
-
-    rows = [
-        _row('scene', "export_resolution", label="Size", context=context),
-        _row('scene', "export_format", label="Format", context=context),
-        _separator(),
-    ]
-
-    materials = bake_mod.paint_materials(obj) if obj is not None else []
-    if not materials:
-        rows.append({"kind": 'label', "label": "No PaintR2 material here",
-                     "active": False})
-
-    # The ellipsis is not decoration: it is the convention that says a button
-    # opens a dialog rather than doing the thing. This one used to do the
-    # thing -- six files, ten frozen seconds, no word about either.
-    rows.append({
-        "kind": 'button',
-        "label": "Bake & Export...",
-        "desc": "Choose what to bake and where to write it",
-        "action": ('bake_export',),
-        "active": bool(materials),
-    })
-    return _compact(rows)
 
 
 def _export_targets(context):
@@ -2798,9 +2751,6 @@ def _display_action(action, *args):
 
     elif action == 'bake_maps':
         _bake_mesh_maps()
-
-    elif action == 'bake_export':
-        _bake_and_export()
 
     elif action == 'browse':
         # ('browse', owner, key) from a path row. One destination so far, and
@@ -3401,7 +3351,11 @@ def _row(owner, key, label=None, text=None, slider=False, active=True,
 
     if prop.type in {'INT', 'FLOAT'}:
         if prop.array_length >= 3 and index is None:
-            row.update(kind='color', value=tuple(value))
+            # The subtype says which space the numbers are in: COLOR is scene
+            # linear and is encoded for the screen, COLOR_GAMMA already is
+            # what the screen shows.
+            row.update(kind='color', value=tuple(value),
+                       gamma=prop.subtype == 'COLOR_GAMMA')
             return row
         if index is not None and prop.array_length:
             value = value[index]
@@ -5175,16 +5129,22 @@ def _remove_draw_handler(handle):
 
 
 def _watchdog():
-    """Detect the window being closed by the OS button and clean up.
+    """Detect the session being left without Close, and clean up.
 
-    Blender gives no notification for that, and the modal operator may not get
-    another event, so this is the only reliable teardown trigger.
+    Blender gives no notification for a window closing or a workspace tab
+    being clicked, and the modal operator may not get another event, so this
+    is the only reliable teardown trigger.
     """
     state = session.state
     if not state.is_open:
         return None
 
-    if session.find_window() is None:
+    # Gone is two things now: the window itself, or the window showing a
+    # different workspace -- a click on one of the topbar's tabs is how the
+    # user leaves without pressing Close, and nothing tells us it happened.
+    window = session.find_window()
+    workspace = _id_by_pointer(bpy.data.workspaces, state.workspace_ptr)
+    if window is None or workspace is None or window.workspace != workspace:
         close(window_already_gone=True)
         return None
 
@@ -5204,71 +5164,118 @@ def _stop_watchdog():
             pass
 
 
-# --- layout reduction -------------------------------------------------------
+# --- the PaintR2 workspace ---------------------------------------------------
+#
+# PaintR2 opens inside the window it was asked from, by switching that window
+# to a workspace of its own, and gives the window back by switching to the
+# workspace it was on. It used to open a second top-level window, and
+# closing that one left the focus to the compositor: on GNOME it went to
+# whatever application had last been used, not to Blender.
+#
+# The workspace comes from `data/workspace.blend` -- one layout, one 3D
+# Viewport -- appended fresh on every open and removed on every close.
+# Duplicating the user's workspace instead copies every layout it has
+# collected, and reducing it to one editor needs `screen.area_close` on a
+# screen that is already showing.
+#
+# Measured, and the reason this is written the way it is:
+#
+#   * `window.workspace = ws` does not switch there and then. It stores the
+#     workspace and posts a notifier; the window changes on the next pass of
+#     the event loop. So opening is two steps, the second on a timer.
+#   * Switching applies the workspace's own `object_mode`: going back to a
+#     Modeling workspace puts an Object-mode model into Edit mode. The mode
+#     the user had is recorded and put back.
+#   * `workspace.delete` deletes the *context* workspace, and a
+#     `temp_override(workspace=...)` does not make that ours -- it deletes
+#     whichever workspace is active. The workspace is removed with
+#     `batch_remove`, by reference, only once no window shows it.
+
+WORKSPACE_FILE = os.path.join(os.path.dirname(__file__), "data", "workspace.blend")
+WORKSPACE_NAME = "PaintR2"
+
+# How long the second step waits for Blender to switch, in seconds.
+_SWITCH_TIMEOUT = 3.0
+
+# The open in progress, between the switch being asked for and it happening.
+_pending = {}
 
 
-def _preferred_area(screen):
-    """The area worth keeping: the biggest 3D Viewport, else the biggest area."""
-    viewports = [a for a in screen.areas if a.type == HOST_AREA_TYPE]
-    pool = viewports or list(screen.areas)
-    return max(pool, key=lambda a: a.width * a.height)
-
-
-def _reduce_to_single_area(context, window):
-    """Close every area but one, leaving the window as a single viewport.
-
-    `window_new_main` clones the entire workspace layout -- properties,
-    outliner, timeline and all. The clone gets its own screen, so closing
-    areas here cannot disturb the layout of the main window.
-
-    The area list is re-read on every pass because closing one reflows the
-    rest; the guard is there so a stubborn area cannot spin this forever.
-    """
-    screen = window.screen
-    if screen is None or not screen.areas:
+def _id_by_pointer(collection, pointer):
+    if not pointer:
         return None
+    for item in collection:
+        if item.as_pointer() == pointer:
+            return item
+    return None
 
-    keep_ptr = _preferred_area(screen).as_pointer()
 
-    for _ in range(16):
-        if len(screen.areas) <= 1:
-            break
-
-        target = next(
-            (a for a in screen.areas if a.as_pointer() != keep_ptr), None
-        )
-        if target is None:
-            break
-
-        try:
-            with context.temp_override(window=window, area=target):
-                bpy.ops.screen.area_close()
-        except RuntimeError:
-            # Some areas refuse to close. The window is still usable; the
-            # extra editor just stays there.
-            break
-
-    if not screen.areas:
+def _window_by_pointer(pointer):
+    wm = bpy.data.window_managers[0] if bpy.data.window_managers else None
+    if wm is None or not pointer:
         return None
+    return _id_by_pointer(wm.windows, pointer)
 
-    return max(screen.areas, key=lambda a: a.width * a.height)
+
+def _append_workspace():
+    """Append a fresh copy of the PaintR2 workspace. Returns it, or None."""
+    if not os.path.isfile(WORKSPACE_FILE):
+        return None
+    with bpy.data.libraries.load(WORKSPACE_FILE) as (source, target):
+        if WORKSPACE_NAME not in source.workspaces:
+            return None
+        target.workspaces = [WORKSPACE_NAME]
+    workspace = target.workspaces[0] if target.workspaces else None
+    # Appending leaves the source file behind as a Library datablock. Nothing
+    # links to it -- the workspace is local -- so it goes.
+    for library in list(bpy.data.libraries):
+        if bpy.path.abspath(library.filepath) == WORKSPACE_FILE:
+            bpy.data.libraries.remove(library)
+    return workspace
 
 
-# --- public API -------------------------------------------------------------
+def _remove_workspace(workspace):
+    """Remove a PaintR2 workspace that no window is showing any more."""
+    if workspace is None:
+        return False
+    wm = bpy.data.window_managers[0] if bpy.data.window_managers else None
+    if wm is not None and any(w.workspace == workspace for w in wm.windows):
+        return False
+    try:
+        bpy.data.batch_remove({workspace, *workspace.screens})
+    except (ReferenceError, RuntimeError):
+        traceback.print_exc()
+        return False
+    return True
+
+
+def _object_mode(context):
+    obj = getattr(context, "active_object", None)
+    return getattr(obj, "mode", 'OBJECT') if obj is not None else 'OBJECT'
+
+
+def _restore_mode(window, mode):
+    """Put the active object back in the mode the user had before PaintR2."""
+    context = bpy.context
+    obj = getattr(context.view_layer.objects, "active", None)
+    if obj is None or not mode or obj.mode == mode:
+        return
+    area = None
+    if window is not None and window.screen is not None and window.screen.areas:
+        area = max(window.screen.areas, key=lambda a: a.width * a.height)
+    try:
+        with context.temp_override(window=window, area=area):
+            bpy.ops.object.mode_set(mode=mode)
+    except (RuntimeError, TypeError):
+        traceback.print_exc()
 
 
 def _refusal_reason(context):
-    """Why Blender will not open a new main window right now.
+    """Why PaintR2 cannot take this window over right now, or "".
 
-    `wm.window_new_main` polls for a screen in its **normal** state. Maximizing
-    an editor (Ctrl+Space) or going fullscreen (Ctrl+Alt+Space) swaps the
-    screen for a non-normal one and the operator refuses -- with a context
-    error that says nothing about which of the two it was. That is how opening
-    PaintR2 came to fail with advice to run it from the sidebar, to somebody
-    who was pressing the button in the sidebar.
-
-    Named as precisely as the state can be read, and honestly vague when it
-    cannot: a wrong reason is worse than no reason.
+    A maximized editor (Ctrl+Space) or a fullscreen one (Ctrl+Alt+Space) has
+    swapped the screen for a non-normal one, and a temporary window cannot
+    change workspace at all -- Blender ignores the assignment.
     """
     screen = getattr(context, "screen", None)
     if screen is None:
@@ -5282,84 +5289,143 @@ def _refusal_reason(context):
         return ("this is one of Blender's temporary windows. Open PaintR2 "
                 "from the 3D Viewport in the main window")
 
-    # The poll refused and none of the states we can read explain it. Say so
-    # rather than inventing one; the console carries Blender's own words.
-    return ("Blender refused, and the reason is not one this add-on can "
-            "read. The console has its message")
+    return ""
 
 
 def spawn(context):
-    """Open the PaintR2 window. Returns (window, area, reason).
+    """Ask for the PaintR2 workspace. Returns a reason it could not, or "".
 
-    `reason` is "" on success and a sentence saying what stopped it otherwise
-    -- one sentence per way of failing, because "could not open a window" is
-    five different problems wearing one coat and the user has to be told which
-    of them they have.
-
-    Does not start the modal event loop; the caller owns that, so that the
-    operator reporting stays in one place.
+    The first of two steps: the window switches on the next pass of the event
+    loop, and `_finish_spawn` does the rest from a timer once it has. One
+    sentence per way of failing, because "could not open" is several problems
+    and the user has to be told which one they have.
     """
+    if session.state.is_open or _pending:
+        return ""
+
+    window = getattr(context, "window", None)
+    if window is None:
+        return ("there is no window in the context. Run this from the 3D "
+                "Viewport sidebar")
+
+    reason = _refusal_reason(context)
+    if reason:
+        return reason
+
+    try:
+        workspace = _append_workspace()
+    except (OSError, RuntimeError) as error:
+        traceback.print_exc()
+        return f"the PaintR2 workspace could not be loaded: {error}"
+    if workspace is None:
+        return "the add-on's workspace file is missing. Reinstall PaintR2"
+
+    previous = window.workspace
+    scene = getattr(context, "scene", None)
+    if scene is not None:
+        scene.paintr2.return_workspace = previous.name
+        scene.paintr2.return_mode = _object_mode(context)
+
+    _pending.clear()
+    _pending.update({
+        "window": window.as_pointer(),
+        "workspace": workspace.as_pointer(),
+        "previous": previous.as_pointer(),
+        "mode": _object_mode(context),
+        "deadline": time.monotonic() + _SWITCH_TIMEOUT,
+    })
+    window.workspace = workspace
+    bpy.app.timers.register(_finish_spawn, first_interval=0.0)
+    return ""
+
+
+def _abandon_spawn(reason):
+    """The second step failed: give the window back and say why."""
+    pending = dict(_pending)
+    _pending.clear()
+    window = _window_by_pointer(pending.get("window"))
+    workspace = _id_by_pointer(bpy.data.workspaces, pending.get("workspace"))
+    previous = _id_by_pointer(bpy.data.workspaces, pending.get("previous"))
+    print(f"[PaintR2] could not open: {reason}")
+    if (window is not None and workspace is not None
+            and previous is not None and window.workspace == workspace):
+        window.workspace = previous
+        window_ptr, workspace_ptr = window.as_pointer(), workspace.as_pointer()
+        mode = pending.get("mode")
+        bpy.app.timers.register(
+            lambda: _finish_leave(window_ptr, workspace_ptr, mode),
+            first_interval=0.0,
+        )
+    else:
+        _remove_workspace(workspace)
+    _report(window, f"Could not open PaintR2: {reason}")
+
+
+def _report(window, message):
+    """Say it where the user is looking. The operator that asked is gone."""
+    def draw(menu, _context):
+        menu.layout.label(text=message)
+
+    wm = bpy.context.window_manager
+    try:
+        with bpy.context.temp_override(window=window):
+            wm.popup_menu(draw, title="PaintR2", icon='ERROR')
+    except (RuntimeError, TypeError):
+        traceback.print_exc()
+
+
+def _finish_spawn():
+    """The second step: the window shows the PaintR2 workspace now."""
     global _draw_error_reported
     global _external_signature
     global _fade_target
 
-    if session.state.is_open:
-        return session.find_window(), session.find_area(), ""
+    if not _pending:
+        return None
 
-    area = getattr(context, "area", None)
-    region = getattr(context, "region", None)
-    if area is None:
-        return None, None, ("there is no editor in the context. Run this from "
-                            "the 3D Viewport sidebar")
+    window = _window_by_pointer(_pending["window"])
+    workspace = _id_by_pointer(bpy.data.workspaces, _pending["workspace"])
+    if window is None or workspace is None:
+        _abandon_spawn("the window or its workspace went away while opening")
+        return None
 
-    known = {win.as_pointer() for win in context.window_manager.windows}
+    if window.workspace != workspace:
+        if time.monotonic() < _pending["deadline"]:
+            return 0.02
+        _abandon_spawn("Blender did not switch to the PaintR2 workspace")
+        return None
 
-    try:
-        with context.temp_override(window=context.window, area=area, region=region):
-            # Asked before it is called, so the refusal can be explained
-            # instead of caught: calling a Blender operator whose poll fails
-            # raises a context error with no room for a reason in it.
-            if not bpy.ops.wm.window_new_main.poll():
-                return None, None, _refusal_reason(context)
-            bpy.ops.wm.window_new_main()
-    except RuntimeError as error:
-        traceback.print_exc()
-        return None, None, f"Blender could not make the window: {error}"
+    screen = window.screen
+    if screen is None or not screen.areas:
+        _abandon_spawn("the PaintR2 workspace came up with nothing in it")
+        return None
 
-    new_windows = [
-        win
-        for win in context.window_manager.windows
-        if win.as_pointer() not in known
-    ]
-    if not new_windows:
-        return None, None, ("Blender reported no error but no window "
-                            "appeared. The console may say more")
+    pending = dict(_pending)
+    _pending.clear()
 
-    window = new_windows[-1]
-    if window.screen is None or not window.screen.areas:
-        return None, None, "the new window came up with nothing in it"
+    area = max(screen.areas, key=lambda a: a.width * a.height)
+    area.type = HOST_AREA_TYPE
 
-    new_area = _reduce_to_single_area(context, window)
-    if new_area is None:
-        return None, None, "the new window had no editor left to use"
-
-    new_area.type = HOST_AREA_TYPE
-
-    space = new_area.spaces.active
+    space = area.spaces.active
     _hide_asked.clear()
-    _dress_host(new_area, space)
+    _dress_host(area, space)
 
     state = session.state
     state.reset()
     state.window_ptr = window.as_pointer()
-    state.area_ptr = new_area.as_pointer()
+    state.area_ptr = area.as_pointer()
     state.space_ptr = space.as_pointer()
+    state.workspace_ptr = pending["workspace"]
+    state.return_workspace_ptr = pending["previous"]
+    state.return_mode = pending["mode"]
 
     _draw_error_reported = False
     _external_signature = None
     _fade_target = 0
 
-    # The tool is saved in the .blend, so a window can open straight into a
+    context = bpy.context
+
+    # The tool is saved in the .blend, so a session can open straight into a
     # fill tool -- and then nobody has pressed anything for the wireframe to
     # follow. Only reachable now that the session knows its space.
     _follow_tool_wireframe(active_tool(context))
@@ -5378,25 +5444,141 @@ def spawn(context):
 
     _start_watchdog()
 
-    # Only the models being painted, from here until the window closes. What
-    # was hidden is written onto the scene so `close` -- or a later session,
-    # if this one never gets to close -- can put it back.
-    isolation.isolate(context)
-    # `sync_fade` is what puts the stage into the materials that need it, so
-    # there is nothing to recompile ahead of it.
-    isolation.sync_fade(context)
+    region = session.find_region(area)
+    with context.temp_override(window=window, area=area, region=region):
+        # Only the models being painted, from here until the session closes.
+        # What was hidden is written onto the scene so `close` -- or a later
+        # session, if this one never gets to close -- can put it back.
+        isolation.isolate(bpy.context)
+        # `sync_fade` is what puts the stage into the materials that need it,
+        # so there is nothing to recompile ahead of it.
+        isolation.sync_fade(bpy.context)
 
+        scene = getattr(bpy.context, "scene", None)
+        if scene is not None:
+            scene.paintr2.session_was_open = True
+            # The switch is saved in the file, the world it needs is not
+            # driven by anything until now: a session that closed lit by
+            # PaintR2 opens lit by PaintR2. `refresh` also does nothing at all
+            # when the switch is off, which is the case that must stay free.
+            lighting.refresh(bpy.context, space)
+
+        try:
+            bpy.ops.paintr2.ui_modal('INVOKE_DEFAULT')
+        except RuntimeError as error:
+            traceback.print_exc()
+            close()
+            _report(window, f"Could not start the PaintR2 interface: {error}")
+            return None
+
+        # If the layer that happens to be active is paintable, be ready to
+        # paint the moment the workspace appears.
+        from . import paint
+        paint.auto_sync_mode(bpy.context)
+
+    area.tag_redraw()
+    return None
+
+
+def _leave_workspace(window):
+    """Switch the window back to where it was, then drop ours.
+
+    Only when the window is still showing ours. Leaving by clicking another
+    workspace tab is leaving *to* that workspace: it is not undone, and the
+    mode is that workspace's business, not ours to put back.
+    """
+    state = session.state
+    workspace = _id_by_pointer(bpy.data.workspaces, state.workspace_ptr)
+    previous = _id_by_pointer(bpy.data.workspaces, state.return_workspace_ptr)
+    if previous is None or previous == workspace:
+        previous = next(
+            (w for w in bpy.data.workspaces if w != workspace), None
+        )
+    if workspace is None:
+        return
+    switching = (window is not None and previous is not None
+                 and window.workspace == workspace)
+    if not switching:
+        _remove_workspace(workspace)
+        _clear_return(bpy.context)
+        return
+    window.workspace = previous
+    window_ptr = window.as_pointer()
+    workspace_ptr = workspace.as_pointer()
+    mode = state.return_mode
+    bpy.app.timers.register(
+        lambda: _finish_leave(window_ptr, workspace_ptr, mode),
+        first_interval=0.0,
+    )
+
+
+def _finish_leave(window_ptr, workspace_ptr, mode, deadline=None):
+    """Once the window has switched: the mode back, the workspace gone."""
+    deadline = deadline or time.monotonic() + _SWITCH_TIMEOUT
+    window = _window_by_pointer(window_ptr)
+    workspace = _id_by_pointer(bpy.data.workspaces, workspace_ptr)
+    if workspace is None:
+        return None
+    if window is not None and window.workspace == workspace:
+        if time.monotonic() < deadline:
+            bpy.app.timers.register(
+                lambda: _finish_leave(window_ptr, workspace_ptr, mode, deadline),
+                first_interval=0.02,
+            )
+        else:
+            print("[PaintR2] Blender did not switch back; the PaintR2 "
+                  "workspace is left in place")
+        return None
+    _restore_mode(window, mode)
+    _remove_workspace(workspace)
+    _clear_return(bpy.context)
+    return None
+
+
+def _clear_return(context):
     scene = getattr(context, "scene", None)
-    if scene is not None:
-        scene.paintr2.session_was_open = True
-        # The switch is saved in the file, the world it needs is not driven by
-        # anything until now: a session that closed lit by PaintR2 opens lit by
-        # PaintR2. `refresh` also does nothing at all when the switch is off,
-        # which is the case that must stay free.
-        lighting.refresh(context, space)
+    if scene is not None and hasattr(scene, "paintr2"):
+        scene.paintr2.return_workspace = ""
+        scene.paintr2.return_mode = ""
 
-    new_area.tag_redraw()
-    return window, new_area, ""
+
+def cleanup_stale_workspaces():
+    """After a file load: a file saved mid-session opens on our workspace.
+
+    There is no session behind it, so the window goes back to the workspace
+    the session was opened from -- recorded on the scene for exactly this --
+    and every PaintR2 workspace is removed once nothing shows it.
+    """
+    stale = [w for w in bpy.data.workspaces
+             if w.name == WORKSPACE_NAME or w.name.startswith(WORKSPACE_NAME + ".")]
+    if not stale:
+        return
+    scene = getattr(bpy.context, "scene", None)
+    props = getattr(scene, "paintr2", None) if scene is not None else None
+    wanted = bpy.data.workspaces.get(props.return_workspace) if props else None
+    mode = props.return_mode if props else ""
+    if wanted in stale:
+        wanted = None
+    fallback = wanted or next(
+        (w for w in bpy.data.workspaces if w not in stale), None
+    )
+    wm = bpy.data.window_managers[0] if bpy.data.window_managers else None
+    showing = []
+    for window in (wm.windows if wm is not None else ()):
+        if window.workspace in stale and fallback is not None:
+            window.workspace = fallback
+            showing.append(window)
+    if not showing:
+        for workspace in stale:
+            _remove_workspace(workspace)
+        return
+    for window in showing:
+        for workspace in stale:
+            bpy.app.timers.register(
+                (lambda wp=window.as_pointer(), sp=workspace.as_pointer():
+                 _finish_leave(wp, sp, mode)),
+                first_interval=0.0,
+            )
 
 
 def _make_root():
@@ -5556,10 +5738,9 @@ def close(window_already_gone=False):
         # the window is still there, because the objects are.
         isolation.restore(bpy.context)
 
-        if not window_already_gone:
-            window = session.find_window()
-            if window is not None:
-                _close_window(window)
+        # The window goes back to the workspace it was on. Ours is removed
+        # once the switch has happened, and with it the shader graph editor.
+        _leave_workspace(None if window_already_gone else session.find_window())
 
         scene = getattr(bpy.context, "scene", None)
         if scene is not None:
@@ -5571,12 +5752,3 @@ def close(window_already_gone=False):
     # whether the session is open, so stripping it out of the materials can
     # only happen once the answer is no.
     isolation.recompile_set()
-
-
-def _close_window(window):
-    context = bpy.context
-    try:
-        with context.temp_override(window=window):
-            bpy.ops.wm.window_close()
-    except RuntimeError:
-        traceback.print_exc()

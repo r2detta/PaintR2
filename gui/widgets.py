@@ -391,6 +391,32 @@ class IconButton(Widget):
         return False
 
 
+class LayerIconButton(IconButton):
+    """Quiet, outlined tools for the layer stack; keeps IconButton gestures."""
+
+    def draw(self):
+        selected = self.active or self.pressed
+        face = theme.MENU_BACK
+        edge = theme.OUTLINE
+        color = theme.WIDGET_TEXT
+        if not self.enabled:
+            color = theme._mix(theme.MENU_BACK, theme.WIDGET_TEXT_DIM, 0.5)
+        elif selected:
+            face = theme._mix(face, theme.ACCENT, 0.22)
+            edge = theme.ACCENT
+        elif self.hovered:
+            face = theme._mix(face, theme.WIDGET_TEXT, 0.09)
+            edge = theme.WIDGET_TEXT_DIM
+            if self.name == 'delete_layer':
+                color = edge = theme.DANGER
+        draw.widget(self.x, self.y, self.width, self.height,
+                    min(self.radius(), self.px(theme.LAYER_RADIUS)), face,
+                    outline=edge, emboss=theme.EMBOSS)
+        size = min(self.width, self.height) * 0.64
+        self.icon(self.x + (self.width - size) / 2,
+                  self.y + (self.height - size) / 2, size, color)
+
+
 class Slider(Widget):
     """A horizontal value bar you drag.
 
@@ -941,6 +967,33 @@ class Row(Container):
             if self.joined and hasattr(child, "corners"):
                 child.corners = _segment_corners(index, len(children))
             x += width + gap
+
+
+class LayerToolbar(Row):
+    """Wrap layer tools at narrow widths, keeping deletion at the far right."""
+
+    def _columns(self, width):
+        return max(1, int((width + self.px(self.gap)) /
+                          max(1, self.px(self.item_width) + self.px(self.gap))))
+
+    def height_for(self, width):
+        count = sum(c.visible and not isinstance(c, Spacer) for c in self.children())
+        rows = max(1, (count + self._columns(width) - 1) // self._columns(width))
+        return rows * self.px(self.item_width) + (rows - 1) * self.px(self.gap)
+
+    def on_resize(self):
+        buttons = [c for c in self.children() if c.visible and not isinstance(c, Spacer)]
+        columns = self._columns(self.width)
+        size, gap = self.px(self.item_width), self.px(self.gap)
+        for i, button in enumerate(buttons):
+            row, col = divmod(i, columns)
+            x = self.x + col * (size + gap)
+            if button is buttons[-1]:
+                x = self.x + self.width - size
+            button.set_rect(x, self.y + self.height - size - row * (size + gap), size, size)
+        for child in self.children():
+            if isinstance(child, Spacer):
+                child.set_rect(self.x, self.y, 0, 0)
 
 
 class Spacer(Widget):

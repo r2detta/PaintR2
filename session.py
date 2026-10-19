@@ -22,6 +22,9 @@ class SessionState:
         "area_ptr",
         "space_ptr",
         "shader_area_ptr",
+        "workspace_ptr",
+        "return_workspace_ptr",
+        "return_mode",
         "draw_handle",
         "modal_running",
         "root",
@@ -39,6 +42,11 @@ class SessionState:
         # "closed by us" but "not there" -- Blender's own controls can close
         # it, and the pointer stops resolving the moment they do.
         self.shader_area_ptr = 0
+        # The PaintR2 workspace the window was switched to, the one it came
+        # from, and the object mode it was in -- what Close gives back.
+        self.workspace_ptr = 0
+        self.return_workspace_ptr = 0
+        self.return_mode = ""
         self.draw_handle = None
         self.modal_running = False
         self.root = None

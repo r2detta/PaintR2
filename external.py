@@ -21,9 +21,11 @@ shipped a binary for.
 
 import math
 import os
+import platform
 import queue
 import struct
 import subprocess
+import sys
 import threading
 
 import bmesh
@@ -78,6 +80,19 @@ _OUTPUT_HEADER = struct.Struct("<8s3I")
 BINARY_NAME = "paintr2_bake"
 
 
+def _host_runs_it():
+    """True on the platform the shipped baker is built for: Linux x86-64.
+
+    Asked before the file is, because the file being there proves nothing. On
+    Windows `os.access(..., X_OK)` is true for any file that exists, and on
+    macOS the executable bit is restored below -- so a Linux binary looked
+    runnable, the external baker was chosen, and the bake failed starting it
+    instead of falling back to Cycles.
+    """
+    return (sys.platform.startswith("linux")
+            and platform.machine().lower() in {"x86_64", "amd64"})
+
+
 def binary_path():
     """Where the baker would be, shipped or built.
 
@@ -85,6 +100,9 @@ def binary_path():
     a user gets, and `PaintR2Bake/bin/` beside the source tree, which is what a
     developer gets without having to install anything.
     """
+    if not _host_runs_it():
+        return None
+
     here = os.path.dirname(os.path.abspath(__file__))
     candidates = (
         os.path.join(here, "bin", BINARY_NAME),

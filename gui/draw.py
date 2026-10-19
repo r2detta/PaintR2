@@ -4,8 +4,8 @@
 Blender 5.x constraints that shape this module:
 
 * ``bgl`` is gone -- all GPU state goes through ``gpu.state.*_set()``.
-* ``GPUShader(vertexcode=..., fragcode=...)`` is gone. Only builtin shaders are
-  used here; a custom shader would need ``GPUShaderCreateInfo``.
+* ``GPUShader(vertexcode=..., fragcode=...)`` is gone. Custom shaders use
+  ``GPUShaderCreateInfo``.
 * The ``'TRI_FAN'`` batch type was removed for Metal compatibility, so rounded
   shapes are emitted as explicit ``'TRIS'`` index lists.
 * ``blf.size(font_id, size)`` takes no DPI argument anymore.
@@ -28,6 +28,7 @@ _smooth_shader = None
 _image_shader = None
 _image_color_shader = None
 _polyline_shader = None
+_linear_gradient_shader = {}
 
 # Unit-circle corner offsets, built once per radius/segment combination.
 _arc_cache = {}
@@ -110,12 +111,13 @@ def polyline_shader():
 def reset_gpu_cache():
     """Drop cached GPU objects. Called on unregister."""
     global _shader, _smooth_shader, _image_shader, _polyline_shader
-    global _image_color_shader
+    global _image_color_shader, _linear_gradient_shader
     _shader = None
     _smooth_shader = None
     _image_shader = None
     _image_color_shader = None
     _polyline_shader = None
+    _linear_gradient_shader = {}
     _arc_cache.clear()
 
 
@@ -517,8 +519,8 @@ def line(x1, y1, x2, y2, color, thickness=1):
 def gradient_rect(x, y, width, height, bottom_left, bottom_right, top_right, top_left):
     """Rectangle with a colour at each corner, interpolated between them.
 
-    Bilinear interpolation is exactly what a saturation/value square needs:
-    white to hue across the top, both fading to black at the bottom.
+    Interpolation is per triangle; use linear_gradient_rect for a bilinear
+    colour field, where a diagonal seam would be visible.
     """
     sh = smooth_shader()
     x2, y2 = x + width, y + height
@@ -533,6 +535,58 @@ def gradient_rect(x, y, width, height, bottom_left, bottom_right, top_right, top
         indices=((0, 1, 2), (0, 2, 3)),
     )
     sh.bind()
+    batch.draw(sh)
+
+
+def linear_gradient_rect(x, y, width, height, bottom_left, bottom_right, top_right,
+                         top_left, encode=True):
+    """Bilinear RGBA field.
+
+    With `encode` the corners are linear and every pixel is encoded to sRGB
+    for display; without it the corners already are display values and are
+    blended as they are -- what the colour picker draws, since it works in
+    sRGB.
+    """
+    sh = _linear_gradient_shader.get(bool(encode))
+    if sh is None:
+        interface = gpu.types.GPUStageInterfaceInfo('paintr2_gradient_interface')
+        interface.smooth('VEC2', 'uv')
+        info = gpu.types.GPUShaderCreateInfo()
+        info.push_constant('MAT4', 'ModelViewProjectionMatrix')
+        for name in ('bottomLeft', 'bottomRight', 'topRight', 'topLeft'):
+            info.push_constant('VEC4', name)
+        info.vertex_in(0, 'VEC2', 'pos')
+        info.vertex_in(1, 'VEC2', 'texCoord')
+        info.vertex_out(interface)
+        info.fragment_out(0, 'VEC4', 'fragColor')
+        info.vertex_source('''
+            void main() {
+                uv = texCoord;
+                gl_Position = ModelViewProjectionMatrix * vec4(pos, 0.0, 1.0);
+            }
+        ''')
+        info.fragment_source('''
+            void main() {
+                vec4 color = mix(mix(bottomLeft, bottomRight, uv.x),
+                                 mix(topLeft, topRight, uv.x), uv.y);
+                vec3 c = clamp(color.rgb, 0.0, 1.0);
+        ''' + ('''
+                c = mix(1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055,
+                        12.92 * c, lessThanEqual(c, vec3(0.0031308)));
+        ''' if encode else "") + '''
+                fragColor = vec4(c, color.a);
+            }
+        ''')
+        sh = gpu.shader.create_from_info(info)
+        _linear_gradient_shader[bool(encode)] = sh
+    batch = batch_for_shader(sh, 'TRIS', {
+        'pos': ((x, y), (x + width, y), (x + width, y + height), (x, y + height)),
+        'texCoord': ((0, 0), (1, 0), (1, 1), (0, 1)),
+    }, indices=((0, 1, 2), (0, 2, 3)))
+    sh.bind()
+    for name, color in zip(('bottomLeft', 'bottomRight', 'topRight', 'topLeft'),
+                           (bottom_left, bottom_right, top_right, top_left)):
+        sh.uniform_float(name, color)
     batch.draw(sh)
 
 

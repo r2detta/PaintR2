@@ -65,11 +65,13 @@ ln -s "$PWD/PaintR2" ~/.config/blender/5.2/extensions/user_default/PaintR2
    whatever was in that material is gone, and only its name survives.
 4. In the **Channels** panel, pick which channels this material carries
    (Base Color, Roughness, Metallic, Normal, Height).
-5. Press **Open PaintR2**. Layers and painting open in a window of their own.
-6. When you are done, **Bake & Export** from that window.
+5. Press **Open PaintR2**. The window switches to a PaintR2 workspace with the
+   layers and painting tools in it.
+6. When you are done, press **Export** in the top right to bake and write the
+   textures, then **Close** to go back to the workspace and mode you came from.
 
 The sidebar is only for setting up; the actual work happens in the PaintR2
-window.
+workspace.
 
 ---
 
@@ -87,7 +89,7 @@ window.
 **Painting**
 - In the 3D viewport, through Blender's own brush engine (pressure and stroke
   smoothing included)
-- Every brush, stroke, falloff, cursor and texture setting, inside the window
+- Every brush, stroke, falloff, cursor and texture setting, inside PaintR2
 - Symmetry: X / Y / Z and a mirror plane
 
 **Fill tools**
@@ -121,7 +123,7 @@ window.
 
 ## Shortcuts
 
-Press `F1` or `?` inside the window for the full list. The common ones:
+Press `F1` or `?` inside PaintR2 for the full list. The common ones:
 
 | Key | What it does |
 |---|---|
@@ -163,7 +165,7 @@ cd PaintR2Bake && ./build.sh
 - **Resolution cannot be changed afterwards.** It is chosen in Set Models and
   stays. Rescaling would mean resampling every layer and every mask, which is an
   unrecoverable loss. If you started wrong, the way out is a new material.
-- **One PaintR2 window at a time.**
+- **One PaintR2 session at a time.**
 - **No UDIM.** A single UV tile.
 - No smart materials or smart masks.
 

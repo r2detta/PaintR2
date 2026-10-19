@@ -118,6 +118,75 @@ def _curve(start, control, end, steps=10):
 
 
 @_icon
+def layer_fill(x, y, size, color):
+    """Tilted paint can and a single droplet, for the layer toolbar."""
+    p, u = _grid(x, y, size)
+    _stroke([p(2.2, 7.5), p(7.3, 12.6), p(12.4, 7.5), p(7.3, 2.4)],
+            color, u, closed=True)
+    _stroke([p(4.6, 13.7), p(7.3, 10.9)], color, u)
+    _stroke([p(3.5, 6.4), p(11.2, 6.4)], color, u)
+    draw.polygon([p(13.5, 6.9), p(12.1, 3.5), p(14.9, 3.5)], color)
+    draw.circle(*p(13.5, 3.4), u * 1.3, color)
+
+
+@_icon
+def layer_paint(x, y, size, color):
+    """Fine brush with a hollow handle and a small bristle tip."""
+    p, u = _grid(x, y, size)
+    _stroke([p(6.2, 6.8), p(12.3, 13.4), p(14, 11.8), p(7.4, 5.7)],
+            color, u, closed=True)
+    _stroke([p(7.5, 8.2), p(9.2, 6.7)], color, u)
+    _stroke(_curve(p(6.2, 6), p(1.8, 6), p(2.1, 2.2)) +
+            _curve(p(2.1, 2.2), p(7.3, 1.7), p(6.2, 6)), color, u)
+
+
+@_icon
+def layer_pattern(x, y, size, color):
+    """Four alternating tiles identify a generated pattern."""
+    p, u = _grid(x, y, size)
+    for gx, gy in ((2.5, 2.5), (9, 2.5), (2.5, 9), (9, 9)):
+        px, py = p(gx, gy)
+        draw.rounded_rect_outline(px, py, 4.5 * u, 4.5 * u, u,
+                                  color, max(1, u * 1.2))
+    draw.circle(*p(4.75, 11.25), u * 0.9, color)
+    draw.circle(*p(11.25, 4.75), u * 0.9, color)
+
+
+@_icon
+def layer_adjust(x, y, size, color):
+    """The familiar half-disc, in the layer toolbar's vector set."""
+    adjustment.vector(x, y, size, color)
+
+
+@_icon
+def layer_group(x, y, size, color):
+    """Outlined folder, matching the other layer tool strokes."""
+    folder.vector(x, y, size, color)
+
+
+@_icon
+def layer_filter(x, y, size, color):
+    """Two adjustment rails distinguish filters from new layers."""
+    p, u = _grid(x, y, size)
+    for gy, knob in ((11, 6), (5, 10)):
+        _stroke([p(2, gy), p(knob - 2, gy)], color, u)
+        _stroke([p(knob + 2, gy), p(14, gy)], color, u)
+        draw.ring(*p(knob, gy), u * 2, color, max(1, u * 1.2))
+
+
+@_icon
+def layer_mask(x, y, size, color):
+    """Half-filled mask tile, kept distinct from circular adjustments."""
+    mask_square.vector(x, y, size, color)
+
+
+@_icon
+def layer_delete(x, y, size, color):
+    """Fine outline bin, with a danger tint supplied only on hover."""
+    trash.vector(x, y, size, color)
+
+
+@_icon
 def fill_bucket(x, y, size, color):
     """A paint bucket with a drip -- 'add a fill layer'."""
     point, unit = _grid(x, y, size)
