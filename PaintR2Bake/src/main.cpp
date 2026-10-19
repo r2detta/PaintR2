@@ -20,6 +20,18 @@
 // tinybvh is vendored as-is and warns under -Wall -Wextra. Silencing it here
 // rather than dropping the flags keeps our own warnings visible, which is the
 // only reason the flags are on.
+// Before tiny_bvh, which includes windows.h *inside its own namespace*: the
+// include guard would then hide every Win32 function from the code below.
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #define TINYBVH_IMPLEMENTATION
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-variable"
@@ -40,18 +52,19 @@
 #include "format.h"
 #include "gpu.h"
 
-#ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#endif
-
 using tinybvh::BVH;
 using tinybvh::BVH8_CPU;
+
+// The BVH the CPU path traces. BVH8_CPU is tiny_bvh's eight-wide AVX2 layout,
+// and on anything else it is a stub that aborts on the first query -- so ARM
+// (Apple Silicon) takes the plain two-wide BVH, which every platform runs.
+// PR2_PORTABLE_BVH forces that on x86 too, which is how the ARM path is
+// checked against the AVX2 one on a machine that has both.
+#if defined(__aarch64__) || defined(_M_ARM64) || defined(PR2_PORTABLE_BVH)
+using CpuBVH = tinybvh::BVH;
+#else
+using CpuBVH = tinybvh::BVH8_CPU;
+#endif
 using tinybvh::BVH_GPU;
 using tinybvh::bvhvec3;
 using tinybvh::bvhvec4;
@@ -664,7 +677,7 @@ Vec3 hit_normal(const Scene& scene, const std::vector<uint32_t>& indices,
 // low-poly's surface is not where the shading happens, and tracing from it
 // produces a plausible image with every cavity displaced.
 
-void project_cpu(const BVH8_CPU& bvh, const Scene& scene,
+void project_cpu(const CpuBVH& bvh, const Scene& scene,
                  const std::vector<uint32_t>& indices, const GBuffer& gbuffer,
                  float extrusion, float ray_distance, Projection& out) {
     const uint32_t size = gbuffer.size;
@@ -834,7 +847,7 @@ void curvature_cpu(const GBuffer& gbuffer, const Projection& projection,
 // The CPU twin of the kernel's `ao_occlusion`. Same rules, same order, same
 // four continuations -- see the comment there for why the backface test is a
 // re-trace rather than a filter inside traversal.
-float ao_occlusion_cpu(const BVH8_CPU& bvh, const std::vector<uint32_t>& indices,
+float ao_occlusion_cpu(const CpuBVH& bvh, const std::vector<uint32_t>& indices,
                        const bvhvec4* vertices, const Vec3& origin,
                        const Vec3& d, float reach, const AOOptions& ao) {
     if (ao.plain()) {
@@ -882,7 +895,7 @@ float ao_occlusion_cpu(const BVH8_CPU& bvh, const std::vector<uint32_t>& indices
     return 0.0f;
 }
 
-void trace_cpu(const BVH8_CPU& bvh, const GBuffer& gbuffer,
+void trace_cpu(const CpuBVH& bvh, const GBuffer& gbuffer,
                const Projection& projection, uint32_t samples, uint32_t want,
                const Reach& reach, const AOOptions& ao,
                const std::vector<uint32_t>& indices, const bvhvec4* vertices,
@@ -1469,12 +1482,12 @@ static int run(const std::vector<std::string>& argv) {
             return 1;
         }
     } else {
-        // BVH8_CPU, not the plain BVH: the eight-wide AVX2 layout answers an
-        // occlusion query two to three times faster, and that query is the
-        // whole inner loop. It costs more memory -- 5.6 GB against 2.3 GB at
-        // sixteen million triangles -- which is a trade worth revisiting if a
-        // mesh ever does not fit.
-        BVH8_CPU bvh;
+        // On x86, BVH8_CPU rather than the plain BVH (`CpuBVH`): the eight-wide
+        // AVX2 layout answers an occlusion query two to three times faster,
+        // and that query is the whole inner loop. It costs more memory --
+        // 5.6 GB against 2.3 GB at sixteen million triangles -- which is a
+        // trade worth revisiting if a mesh ever does not fit.
+        CpuBVH bvh;
         bvh.Build(vertices.data(), indices.data(), triangles);
         const float diagonal = derive(bvh.aabbMin, bvh.aabbMax);
         if (curvature_scale <= 0.0f) curvature_scale = diagonal * 0.02f;
@@ -1505,7 +1518,7 @@ static int run(const std::vector<std::string>& argv) {
                 trace_cpu(bvh, gbuffer, projection, samples, own, reach, ao,
                           indices, vertices.data(), maps);
             }
-            BVH8_CPU occ_bvh;
+            CpuBVH occ_bvh;
             occ_bvh.Build(occ_vertices.data(), occ_indices.data(), occ_triangles);
             trace_cpu(occ_bvh, gbuffer, projection, samples,
                       want & (pr2::kMapAO | pr2::kMapBentNormal), reach, ao,

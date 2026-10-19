@@ -77,8 +77,9 @@ if(MSVC)
         /arch:AVX2 /fp:precise /utf-8 /W3 /EHsc
         /wd4068  # unknown pragma: the GCC diagnostic pragmas around tiny_bvh
     )
+    # Not WIN32_LEAN_AND_MEAN: tiny_bvh defines it itself and would warn.
     target_compile_definitions(paintr2_bake PRIVATE
-        _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
+        _CRT_SECURE_NO_WARNINGS NOMINMAX)
     # One file to ship: the C runtime linked in, not a VC++ redistributable
     # the user may not have.
     set_property(TARGET paintr2_bake PROPERTY
