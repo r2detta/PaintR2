@@ -484,7 +484,13 @@ def build_channel(group, proc, channel, x, y):
 
 
 def _instance(group, proc, x, y):
-    """A ShaderNodeGroup pointing at the user's tree, or None."""
+    """A ShaderNodeGroup pointing at the user's tree, or None.
+
+    The one place a custom group is instanced -- as a layer, as a mask, as a
+    pattern effect -- so it is also the one place the group's map inputs are
+    fed (see "map inputs" below). Whatever material this compile is for, its
+    own baked maps land on the group's sockets here.
+    """
     tree = proc.node_tree
     if tree is None:
         return None
@@ -493,6 +499,12 @@ def _instance(group, proc, x, y):
     node.node_tree = tree
     node.label = tree.name
     node.location = (x + 360.0, y)
+
+    material = proc.id_data
+    if isinstance(material, bpy.types.Material):
+        # Before the node is read: a socket added here is on the node already.
+        ensure_map_inputs(tree, material)
+        _feed_map_inputs(group, node, tree, material, x, y)
     return node
 
 
@@ -627,6 +639,10 @@ def ensure_custom_tree(proc, material, label="Custom"):
     output = tree.nodes.new('NodeGroupOutput')
     output.location = (0.0, 0.0)
 
+    # Whatever has been baked for this material is on the group from the
+    # first time it is opened, so the Group Input node already offers it.
+    ensure_map_inputs(tree, material)
+
     proc.node_tree = tree
     return tree
 
@@ -662,6 +678,275 @@ def _ensure_custom_output(tree):
         )
 
     return tree.interface.items_tree
+
+
+# --- map inputs: what a custom group asks the model for ----------------------
+#
+# A custom group that reads the model's own maps -- edge wear from curvature,
+# dirt from occlusion -- used to carry an Image Texture node pointing at one
+# material's bake. Shared between materials it kept pointing at the
+# first one's. There is no way round that inside the group: a shader group
+# cannot take an Image through a socket (measured on 5.2: Image, String and
+# Object are not socket types a ShaderNodeTree accepts), and the group is one
+# datablock however many materials instance it.
+#
+# So the group does not *hold* the map, it *asks* for it. It declares an input
+# socket per map it wants, and the compiler -- which builds one tree per
+# material and rebuilds it on every change -- samples that material's bake
+# into the socket from outside. The same group on two materials reads two
+# different maps, with no copy of anything.
+#
+# Which socket means which map is recorded on the group itself, as an ID
+# property keyed by socket *identifier*: the identifier survives a rename
+# (measured), and a record on the group travels with it into every layer,
+# material and file it is appended to. Interface sockets cannot carry ID
+# properties of their own (measured), which is why the record is one level
+# up.
+#
+# A map that has not been baked leaves the socket unlinked and the socket's
+# own default takes over -- white occlusion, flat curvature. The group keeps
+# working and the model looks clean, which is the honest result.
+
+MAP_INPUTS_KEY = "paintr2_map_inputs"
+
+# Socket type and the value a socket carries while its map is not baked.
+# Single-channel maps are Floats: inside the group they read as the value
+# they are, and go straight into Map Range or Math. Blender averages an
+# Image Texture's colour down to one when it links into a Float, which for a
+# grey map is the map. The vector maps stay colours.
+MAP_SOCKETS = {
+    'AO': ('NodeSocketFloat', 1.0),
+    'CURVATURE': ('NodeSocketFloat', 0.5),
+    'THICKNESS': ('NodeSocketFloat', 1.0),
+    'HEIGHT': ('NodeSocketFloat', 0.5),
+    'POSITION': ('NodeSocketColor', (0.5, 0.5, 0.5, 1.0)),
+    'NORMAL': ('NodeSocketColor', (0.5, 0.5, 1.0, 1.0)),
+    'BENT_NORMAL': ('NodeSocketColor', (0.5, 0.5, 1.0, 1.0)),
+}
+
+MAP_IDS = tuple(MAP_SOCKETS)
+
+
+def _input_items(tree):
+    """{identifier: interface socket} for the group's inputs."""
+    return {
+        item.identifier: item
+        for item in tree.interface.items_tree
+        if item.item_type == 'SOCKET' and item.in_out == 'INPUT'
+    }
+
+
+def _records(tree):
+    """The binding record as a plain dict. An ID property group otherwise."""
+    stored = tree.get(MAP_INPUTS_KEY)
+    if stored is None:
+        return {}
+    if hasattr(stored, "to_dict"):
+        stored = stored.to_dict()
+    return {str(key): str(value) for key, value in dict(stored).items()}
+
+
+def _map_by_name(name):
+    """The map a socket called `name` is asking for by name alone, or None.
+
+    The label (`Ambient Occlusion`) or the identifier (`AO`), either case:
+    hand-built groups are not going to match the table's spelling exactly.
+    """
+    from . import meshmaps
+
+    wanted = name.strip().lower()
+    for identifier in MAP_IDS:
+        if wanted in (
+            meshmaps.map_label(identifier).lower(),
+            identifier.lower().replace("_", " "),
+        ):
+            return identifier
+    return None
+
+
+def map_bindings(tree):
+    """{socket identifier: map id} for every input the compiler should feed.
+
+    A recorded binding wins. A socket the record has never heard of binds by
+    its name as a fallback, so a group built by hand with an input called
+    `Curvature` works without a click. A socket recorded as "" is one the
+    user unbound on purpose: it keeps its name and is *not* matched by it
+    again. A record for a socket that no longer exists is simply skipped.
+    """
+    if tree is None:
+        return {}
+
+    records = _records(tree)
+    out = {}
+    for identifier, item in _input_items(tree).items():
+        if identifier in records:
+            if records[identifier] in MAP_SOCKETS:
+                out[identifier] = records[identifier]
+            continue
+        found = _map_by_name(item.name)
+        if found is not None:
+            out[identifier] = found
+    return out
+
+
+def bound_map(tree, map_id):
+    """The identifier of the socket fed with `map_id`, or None."""
+    for identifier, bound in map_bindings(tree).items():
+        if bound == map_id:
+            return identifier
+    return None
+
+
+def bind_map_input(tree, map_id):
+    """Make sure the group has an input fed with `map_id`. Returns its socket.
+
+    Reuses what is there: a socket already bound to this map is left alone,
+    and one that was unbound (or matches by name) is bound again rather than
+    doubled. Only when nothing fits is a new socket added, typed and
+    defaulted from `MAP_SOCKETS`.
+    """
+    from . import meshmaps
+
+    socket_type, default = MAP_SOCKETS[map_id]
+    items = _input_items(tree)
+    records = _records(tree)
+
+    identifier = bound_map(tree, map_id)
+    if identifier is None:
+        # An unbound or name-matching socket this map can take back.
+        for candidate, item in items.items():
+            if records.get(candidate, None) == "" and _map_by_name(item.name) == map_id:
+                identifier = candidate
+                break
+
+    if identifier is None:
+        item = tree.interface.new_socket(
+            meshmaps.map_label(map_id), in_out='INPUT', socket_type=socket_type,
+        )
+        try:
+            item.default_value = default
+        except (AttributeError, TypeError):
+            pass
+        identifier = item.identifier
+    else:
+        item = items[identifier]
+
+    records[identifier] = map_id
+    tree[MAP_INPUTS_KEY] = records
+    return item
+
+
+def unbind_map_input(tree, map_id):
+    """Stop feeding `map_id`. The socket stays; only the binding goes.
+
+    The user's links inside the group hang off that socket, and taking the
+    socket away would take them too. Recorded as "" rather than deleted so
+    the name does not bind it straight back.
+    """
+    identifier = bound_map(tree, map_id)
+    if identifier is None:
+        return False
+    records = _records(tree)
+    records[identifier] = ""
+    tree[MAP_INPUTS_KEY] = records
+    return True
+
+
+def ensure_map_inputs(tree, material):
+    """Bind every map `material` has baked that the group does not ask for yet.
+
+    Nothing to tick (user decision): a baked map is a map the group
+    can use, so it is offered the moment it exists -- on the first compile
+    after a bake, or when the group is made for a material that already has
+    maps. The one thing that holds a map back is a socket the user unbound
+    on purpose (recorded as ""), which stays unbound.
+
+    A group shared between materials ends up asking for the union of their
+    maps; a material missing one leaves that socket on its default.
+    """
+    from . import meshmaps
+
+    records = _records(tree)
+    items = _input_items(tree)
+    bound = set(map_bindings(tree).values())
+    refused = {
+        _map_by_name(items[identifier].name)
+        for identifier, value in records.items()
+        if value == "" and identifier in items
+    }
+
+    added = False
+    for map_id in MAP_IDS:
+        if map_id in bound or map_id in refused:
+            continue
+        if meshmaps.stored(material, map_id) is None:
+            continue
+        bind_map_input(tree, map_id)
+        added = True
+    return added
+
+
+def _map_texture(group, tree, map_id, image, x, y):
+    """The Image Texture sampling `image` for this group in this compile.
+
+    One per (group, map) however many channels, masks and effects instance
+    the group: `build_channel` emits a group node per channel, and five
+    samplers of one map would be five texture reads per pixel. Found by name
+    the way `nodegen._owned_node` finds its own; the compiled tree is cleared
+    at the start of every compile, so a hit is always this compile's.
+    """
+    name = f"PR2 map {map_id} {tree.name}"
+    node = group.nodes.get(name)
+    if node is not None and node.image is image:
+        return node
+
+    node = group.nodes.new('ShaderNodeTexImage')
+    node.name = name
+    node.label = f"{tree.name} <- {map_id}"
+    node.image = image
+    # The same rule as the map preview: a tiny map is read point for point.
+    node.interpolation = 'Closest' if max(image.size) <= 64 else 'Linear'
+    node.location = (x - 300.0, y - 200.0)
+    return node
+
+
+def _feed_map_inputs(group, node, tree, material, x, y):
+    """Link `material`'s baked maps into the group node's bound inputs."""
+    from . import meshmaps
+
+    bindings = map_bindings(tree)
+    if not bindings:
+        return
+
+    for identifier, map_id in bindings.items():
+        image = meshmaps.stored(material, map_id)
+        if image is None:
+            continue
+        target = next(
+            (item for item in node.inputs if item.identifier == identifier),
+            None,
+        )
+        if target is None:
+            continue
+        sampler = _map_texture(group, tree, map_id, image, x, y)
+        group.links.new(sampler.outputs["Color"], target)
+
+
+def materials_using(tree):
+    """Every material whose stack instances `tree`, anywhere in a layer."""
+    found = []
+    for material in bpy.data.materials:
+        document = getattr(material, "paintr2", None)
+        if document is None:
+            continue
+        for layer in document.layers:
+            blocks = [layer.procedural, layer.mask_procedural]
+            blocks += [effect.pattern for effect in layer.effects]
+            blocks += [effect.pattern for effect in layer.mask_effects]
+            if any(block.node_tree is tree for block in blocks):
+                found.append(material)
+                break
+    return found
 
 
 # --- helpers the interface uses ----------------------------------------------

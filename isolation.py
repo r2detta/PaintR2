@@ -13,7 +13,7 @@ recorded, so a model the user had already hidden stays hidden afterwards.
 **Fade.** The model being worked on is drawn as it is; the rest of the set
 is **darkened** so it still reads as context without competing. Darkened and
 not made see-through: transparency was tried and it went wrong three ways at
-once (D147b), all of them consequences of a transparent surface having to be
+once, all of them consequences of a transparent surface having to be
 sorted against itself. One shader stage, built by `nodegen` and driven by
 `object.color`'s alpha -- an Object Info node reads it per object, so two
 models sharing a material would still darken independently.
@@ -159,6 +159,56 @@ def suspended(context=None):
                     obj.hide_set(True, view_layer=view_layer)
 
 
+# --- solo ---------------------------------------------------------------------
+
+
+def sync_solo(context=None):
+    """Hide every model in the set but the active one, or show them again.
+
+    The hidden models go into the same record as the isolation, so `restore`,
+    `suspended` and a crash recovery treat them exactly like everything else
+    the session hid. Showing only undoes what is recorded: a model the user
+    hid themselves is not ours to show.
+
+    Only while the window is open and the active object is in the set --
+    with nothing in the set selected there is nothing to show "only", and
+    hiding all of it would leave an empty view with no hint why.
+    """
+    from . import session
+
+    context = context or bpy.context
+    props = _scene_props(context)
+    view_layer = getattr(context, "view_layer", None)
+    if props is None or view_layer is None:
+        return
+
+    active = getattr(context, "active_object", None)
+    objects = paintset.paint_objects()
+    solo = (props.display.solo_active and session.state.is_open
+            and any(obj == active for obj in objects))
+
+    recorded = [entry.name for entry in props.hidden_objects]
+    for obj in objects:
+        hide = solo and obj != active
+        try:
+            hidden = obj.hide_get(view_layer=view_layer)
+        except RuntimeError:
+            continue
+
+        if hide and not hidden:
+            with contextlib.suppress(RuntimeError):
+                obj.hide_set(True, view_layer=view_layer)
+                if obj.name not in recorded:
+                    props.hidden_objects.add().name = obj.name
+                    recorded.append(obj.name)
+        elif not hide and hidden and obj.name in recorded:
+            with contextlib.suppress(RuntimeError):
+                obj.hide_set(False, view_layer=view_layer)
+                index = recorded.index(obj.name)
+                props.hidden_objects.remove(index)
+                recorded.pop(index)
+
+
 # --- fade ---------------------------------------------------------------------
 
 
@@ -218,6 +268,10 @@ def sync_fade(context=None):
     props = _scene_props(context)
     if props is None:
         return
+
+    # Every caller that re-aims the fade is also one where the solo target
+    # may have moved, so it rides along rather than being wired in twice.
+    sync_solo(context)
 
     objects = paintset.paint_objects()
     if not objects:

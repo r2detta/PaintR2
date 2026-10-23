@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 150" width="880" height="150" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8a8f98"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="880" height="150" rx="12" fill="#ffffff"/>
+  <g font-size="15" text-anchor="middle">
+    <g>
+      <rect x="10" y="30" width="150" height="80" rx="10" fill="#f3f4f6" stroke="#8a8f98" stroke-width="1.5"/>
+      <text x="85" y="62" fill="#24292f" font-weight="600">1. Select</text>
+      <text x="85" y="86" fill="#57606a" font-size="13">your mesh(es)</text>
+    </g>
+    <line x1="160" y1="70" x2="188" y2="70" stroke="#8a8f98" stroke-width="2" marker-end="url(#a)"/>
+    <g>
+      <rect x="190" y="30" width="150" height="80" rx="10" fill="#f3f4f6" stroke="#8a8f98" stroke-width="1.5"/>
+      <text x="265" y="62" fill="#24292f" font-weight="600">2. Set Models</text>
+      <text x="265" y="86" fill="#57606a" font-size="13">N panel → PaintR2</text>
+    </g>
+    <line x1="340" y1="70" x2="368" y2="70" stroke="#8a8f98" stroke-width="2" marker-end="url(#a)"/>
+    <g>
+      <rect x="370" y="30" width="150" height="80" rx="10" fill="#f3f4f6" stroke="#8a8f98" stroke-width="1.5"/>
+      <text x="445" y="62" fill="#24292f" font-weight="600">3. Open PaintR2</text>
+      <text x="445" y="86" fill="#57606a" font-size="13">its own workspace</text>
+    </g>
+    <line x1="520" y1="70" x2="548" y2="70" stroke="#8a8f98" stroke-width="2" marker-end="url(#a)"/>
+    <g>
+      <rect x="550" y="30" width="150" height="80" rx="10" fill="#f3f4f6" stroke="#8a8f98" stroke-width="1.5"/>
+      <text x="625" y="62" fill="#24292f" font-weight="600">4. Paint</text>
+      <text x="625" y="86" fill="#57606a" font-size="13">layers, fills, masks</text>
+    </g>
+    <line x1="700" y1="70" x2="728" y2="70" stroke="#8a8f98" stroke-width="2" marker-end="url(#a)"/>
+    <g>
+      <rect x="730" y="30" width="140" height="80" rx="10" fill="#dbeafe" stroke="#3b82f6" stroke-width="1.5"/>
+      <text x="800" y="62" fill="#1e3a8a" font-weight="600">5. Export</text>
+      <text x="800" y="86" fill="#1e40af" font-size="13">Base Color texture</text>
+    </g>
+  </g>
+</svg>

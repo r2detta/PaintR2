@@ -6,22 +6,18 @@ goes into a node group named `PaintR2 <material>`, which is rebuilt from
 scratch on every change. Nothing inside that group is meant to be edited by
 hand -- edits belong outside it, where they survive.
 
-The group carries **one output per channel** the document uses, and the
-material is wired through a Principled BSDF:
+The group carries **one output per channel** the document uses -- today
+that is Base Color alone -- and the material is wired through a
+Principled BSDF:
 
     [PaintR2 group] Base Color -> [Principled] -> [Material Output]
-                    Roughness  ->
-                    Metallic   ->
-                    Normal     -> [Normal Map] -\
-                    Height     -> [Bump] <------/ -> Principled.Normal
 
-That is the PBR mode, and the default. Three other modes wire the same group
+That is the PBR mode, and the default. Two other modes wire the same group
 to the same output differently, because judging a painted colour and judging a
 finished material are not the same job:
 
-    DIFFUSE   Base Color -> Principled, Metallic 0 / Roughness 1, no relief
+    DIFFUSE   Base Color -> Principled, Metallic 0 / Roughness 1
     UNLIT     Base Color -> Emission -> output, no light on it at all
-    CHANNEL   one channel -> Emission -> output, as a grey image
 
 The mode lives on the document (`shader_mode`), so it is per material. None of
 it can reach an export: bake.py sets up its own Emission per channel and reads
@@ -65,9 +61,8 @@ Blender 5.2 specifics that matter here, all measured:
     ShaderNodeMath instead, via `_SCALAR_BLEND`, and the ones with no float
     equivalent fall back to a lerp.
   * **Math node output is not clamped**: ADD gives 1.1, SUBTRACT gives -0.7.
-    Every scalar channel is clamped on the way out, Height included -- its
-    flat point is 0.5, so a dent is a value below the middle rather than a
-    negative number.
+    Every scalar channel is clamped on the way out (`_CLAMPED`; none exist
+    while Base Color is the only channel).
   * Removing an output socket from a group interface **silently drops** the
     link that fed from it, and re-adding the socket does not bring the link
     back. So changing the channel set means re-wiring the material, which is
@@ -114,12 +109,11 @@ _SCALAR_BLEND = {
     'DIFFERENCE': 'ABSOLUTE',
 }
 
-# Scalar channels whose result is clamped to 0..1 before it leaves the group.
-# All of them: Math nodes do not clamp (ADD gives 1.1, SUBTRACT -0.7), and
-# every scalar channel here is defined on 0..1 -- Height included, because its
-# flat point is 0.5 rather than 0 and a dent is a value below the middle, not
-# a negative number.
-_CLAMPED = frozenset({'ROUGHNESS', 'METALLIC', 'HEIGHT'})
+# Scalar channels whose result is clamped to 0..1 before it leaves the group:
+# Math nodes do not clamp (ADD gives 1.1, SUBTRACT -0.7). Empty while Base
+# Color is the only channel; every scalar channel that comes back is
+# defined on 0..1 and belongs here.
+_CLAMPED = frozenset()
 
 
 # --- socket helpers ---------------------------------------------------------
@@ -946,10 +940,11 @@ _OWNED = {
 _FADE_NODES = {"fade_info", "fade_dark", "fade_mix"}
 
 _MODE_NODES = {
-    'PBR': {"group", "bsdf", "bump", "normal_map", "output"},
+    # "bump" and "normal_map" are in no mode any more. They stay in
+    # _OWNED so a file saved with a Normal or Height channel has them pruned.
+    'PBR': {"group", "bsdf", "output"},
     'DIFFUSE': {"group", "bsdf", "output"},
     'UNLIT': {"group", "emission", "output"},
-    'CHANNEL': {"group", "emission", "output"},
     # The stack is still compiled and the group node still there -- switching
     # to a map preview and back must not disturb a single layer.
     'MESH_MAP': {"group", "emission", "map_image", "output"},
@@ -1023,7 +1018,7 @@ def _surface_output(tree):
 # Not "with the factor set to one" -- with the nodes absent. A stage that is
 # there and inert is still a difference between the model being painted and
 # the same model with the option off, and the first version of this had one
-# that showed (D147a).
+# that showed.
 _faded_materials = set()
 
 
@@ -1077,7 +1072,7 @@ def _fade_is_on(material):
 def _wire_fade(tree, surface):
     """Put the fade stage between `surface` and the output. Returns the socket.
 
-    The model is **darkened, not made see-through** (D147b). Transparency was
+    The model is **darkened, not made see-through**. Transparency was
     the first answer and it was the wrong one three separate ways: a material
     carrying a Transparent BSDF is drawn down a different path even at alpha
     1.0, blended transparency does not write depth, and a see-through model
@@ -1170,15 +1165,12 @@ def ensure_material_wiring(material, group):
     the same way for all of them, so switching modes never touches a layer,
     a mask or a channel value:
 
-        PBR       every channel -> Principled, Normal and Height through the
-                  Bump chain. The look the material has.
-        DIFFUSE   Base Color -> Principled, with Metallic 0, Roughness 1 and
-                  no relief. Lit enough to read the form, flat enough that
-                  the colour is still the colour.
+        PBR       Base Color -> Principled. The look the material has.
+        DIFFUSE   Base Color -> Principled, with Metallic 0 and Roughness 1.
+                  Lit enough to read the form, flat enough that the colour
+                  is still the colour.
         UNLIT     Base Color -> Emission -> output. No light touches it.
-        CHANNEL   one channel -> Emission -> output, as a grey image. A float
-                  socket driving a colour one is read as grey by Blender, so
-                  Roughness and Height need no conversion node.
+        MESH_MAP  a baked mesh map -> Emission -> output.
     """
     material.use_nodes = True
     tree = material.node_tree
@@ -1201,8 +1193,8 @@ def ensure_material_wiring(material, group):
 
     if mode == 'MESH_MAP':
         surface = _wire_mesh_map(tree, document)
-    elif mode in ('UNLIT', 'CHANNEL'):
-        surface = _wire_emission(tree, document, group_node, mode)
+    elif mode == 'UNLIT':
+        surface = _wire_emission(tree, document, group_node)
     else:
         surface = _wire_principled(tree, document, group_node, mode)
 
@@ -1232,32 +1224,21 @@ def _wire_principled(tree, document, group_node, mode):
         _set_input(bsdf, "IOR", 1.0)
         return bsdf.outputs["BSDF"]
 
-    for channel, target in (('ROUGHNESS', "Roughness"), ('METALLIC', "Metallic")):
-        source = _channel_output(group_node, document, channel)
-        if source is not None:
-            tree.links.new(source, bsdf.inputs[target])
-
-    _wire_surface_detail(tree, document, group_node, bsdf)
+    # Principled's own defaults, written back: there is no Roughness or
+    # Metallic channel to drive them, and Diffuse may have left its
+    # values on this node.
+    _set_input(bsdf, "Metallic", 0.0)
+    _set_input(bsdf, "Roughness", 0.5)
+    _set_input(bsdf, "IOR", 1.5)
     return bsdf.outputs["BSDF"]
 
 
-def _wire_emission(tree, document, group_node, mode):
-    """Unlit and Channel. Returns the socket to drive the output with."""
+def _wire_emission(tree, document, group_node):
+    """Unlit. Returns the socket to drive the output with."""
     emission = _owned_node(tree, "emission", 'ShaderNodeEmission', (-120.0, 0.0))
     _set_input(emission, "Strength", 1.0)
 
-    if mode == 'CHANNEL':
-        channel = document.preview_target()
-    else:
-        channel = 'BASE_COLOR' if document.uses('BASE_COLOR') else None
-        if channel is None:
-            # A material with no colour channel has nothing to show unlit;
-            # falling back to whatever it does have beats a black model.
-            channel = document.preview_target()
-
-    source = None if channel is None else _channel_output(
-        group_node, document, channel
-    )
+    source = _channel_output(group_node, document, 'BASE_COLOR')
     if source is not None:
         tree.links.new(source, emission.inputs["Color"])
     else:
@@ -1301,61 +1282,6 @@ def _set_input(node, name, value):
             socket.default_value = value
         except (AttributeError, TypeError, ValueError):
             pass
-
-
-def _wire_surface_detail(tree, document, group_node, bsdf):
-    """Normal and Height into Principled.Normal, in the four possible states.
-
-    Both channels perturb the shading normal, so they meet before Principled
-    rather than fighting over the socket: the Normal channel becomes a normal
-    through a Normal Map node, and that becomes the *base* the Bump node
-    displaces. Measured working in both Cycles and EEVEE.
-
-        Normal  Height   Principled.Normal gets
-        off     off      nothing
-        on      off      Normal Map
-        off     on       Bump, with no base normal
-        on      on       Bump, based on Normal Map
-    """
-    from . import document as doc
-
-    use_normal = document.uses('NORMAL')
-    use_height = document.uses('HEIGHT')
-
-    for key, wanted in (("normal_map", use_normal), ("bump", use_height)):
-        node = tree.nodes.get(_OWNED[key])
-        if node is not None and not wanted:
-            tree.nodes.remove(node)
-
-    if not (use_normal or use_height):
-        return
-
-    normal_socket = None
-    if use_normal:
-        normal_map = _owned_node(
-            tree, "normal_map", 'ShaderNodeNormalMap', (-380.0, -260.0)
-        )
-        normal_map.inputs["Strength"].default_value = document.normal_scale
-        source = group_node.outputs.get(doc.channel_label('NORMAL'))
-        if source is not None:
-            tree.links.new(source, normal_map.inputs["Color"])
-        normal_socket = normal_map.outputs["Normal"]
-
-    if use_height:
-        bump = _owned_node(tree, "bump", 'ShaderNodeBump', (-380.0, -460.0))
-        # Scene units, not a factor: the plan's default sits inside the range
-        # the node actually responds to, and the control exists because that
-        # range moves with the object's scale.
-        bump.inputs["Distance"].default_value = document.height_scale
-        source = group_node.outputs.get(doc.channel_label('HEIGHT'))
-        if source is not None:
-            tree.links.new(source, bump.inputs["Height"])
-        if normal_socket is not None:
-            tree.links.new(normal_socket, bump.inputs["Normal"])
-        normal_socket = bump.outputs["Normal"]
-
-    if normal_socket is not None:
-        tree.links.new(normal_socket, bsdf.inputs["Normal"])
 
 
 def compile_material(material):

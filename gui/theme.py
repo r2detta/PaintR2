@@ -116,6 +116,11 @@ EFFECT_MARK = (0.361, 0.784, 0.435, 1.0)
 LIST_SEL = (0.278, 0.447, 0.702, 1.0)
 LIST_HOVER = (1.0, 1.0, 1.0, 0.2)
 BOX_INNER = (0.114, 0.114, 0.114, 0.502)
+# Behind an open sub-panel (AO, Curvature...): a white wash that lifts the box
+# it sits in by SUBPANEL_LIFT of value, and a nested one a step further. The
+# alpha is worked out by `_wash`, not typed -- see there for why 0.04 was not
+# "slightly lighter" but a grey the number fields disappeared into.
+SUBPANEL_LIFT = 0.03
 
 # Menus and tooltips are their own colour set in Blender; matching that is
 # what makes a popup of ours look like one of its own.
@@ -264,6 +269,31 @@ def _mix(a, b, amount):
     ) + (a[3],)
 
 
+def _to_linear(value):
+    if value <= 0.04045:
+        return value / 12.92
+    return ((value + 0.055) / 1.055) ** 2.4
+
+
+def _wash(base, lift):
+    """White at the alpha that lifts `base` by `lift` of displayed value.
+
+    Blending happens on linear values, so a white wash is far stronger on a
+    dark grey than its alpha suggests: 4% over the 0.11 panel grey came out at
+    0.25, the same grey as a number field. The alpha is solved for instead:
+    the linear step from `base` to `base + lift`, over what white has left to
+    give.
+    """
+    value = max(base[:3])
+    low = _to_linear(value)
+    high = _to_linear(min(1.0, value + lift))
+    alpha = (high - low) / (1.0 - low) if low < 1.0 else 0.0
+    return (1.0, 1.0, 1.0, max(0.0, alpha))
+
+
+SUBPANEL_BACK = _wash(BOX_INNER, SUBPANEL_LIFT)
+
+
 def hover(color):
     """Blender's hover rule: the same colour, lifted.
 
@@ -324,6 +354,7 @@ def _derive(ui, view3d):
         "LIST_SEL": selection,
         "LIST_HOVER": _rgba(item.item),
         "BOX_INNER": _rgba(box.inner),
+        "SUBPANEL_BACK": _wash(_rgba(box.inner), SUBPANEL_LIFT),
 
         "MENU_BACK": _rgba(menu_back.inner),
         "MENU_OUTLINE": _rgba(menu_back.outline),

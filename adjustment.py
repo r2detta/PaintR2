@@ -61,11 +61,6 @@ PARAMS = {
 # called, so the panel and the compiler agree without either of them guessing.
 COLOR_ONLY = frozenset({'HSV'})
 
-# Channels a colour-only kind still must not touch. A normal map is a colour
-# by storage and a direction by meaning; rotating its hue turns the surface
-# to face somewhere nobody asked for.
-_NOT_A_COLOUR = frozenset({'NORMAL'})
-
 
 def _recompile(self, context):
     owner = self.id_data
@@ -357,8 +352,6 @@ def applies_to(kind, channel, is_color=None):
     if is_color is None:
         is_color = doc.channel_kind(channel) == 'COLOR'
 
-    if channel in _NOT_A_COLOUR and kind in COLOR_ONLY:
-        return False
     if kind in COLOR_ONLY:
         return is_color
     return True

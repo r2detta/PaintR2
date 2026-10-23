@@ -186,6 +186,8 @@ class UIRoot(Container):
     # The brush strip, unscaled. Blender's tool header is one widget tall and
     # so is this; the widths are what each control needs to stay readable.
     BRUSH_BAR_HEIGHT = 30
+    # One wheel notch over an overflowing strip, at 1x.
+    STRIP_SCROLL_STEP = 60
     BRUSH_PICKER_WIDTH = 132
     BRUSH_BLEND_WIDTH = 104
     BRUSH_SWATCH = 22
@@ -305,6 +307,8 @@ class UIRoot(Container):
         self.on_layer_move = None
         self.on_layer_reorder = None
         self.on_layer_rename = None
+        # (index) -- a Custom layer's chip was double-clicked.
+        self.on_layer_edit_nodes = None
         self.on_brush_select = None
         self.on_brush_blend = None
         self.on_brush_color = None
@@ -587,6 +591,14 @@ class UIRoot(Container):
         # -- through `paint.brush_owner`, because unified paint settings
         # override the brush for colour and size.
         self.brush_bar = self.add(Box('BG_PANEL', "brush_bar"))
+        # Whether `sync_brush` last had a brush and a target to show.
+        self._brush_available = True
+        # How far the strip is scrolled left, in pixels. Blender's headers do
+        # the same when they overflow: wheel or middle-drag over them slides
+        # the controls across, so nothing past the edge is out of reach.
+        self._strip_scroll = 0
+        self._strip_content = 0
+        self._strip_drag = None
 
         self.brush_picker = self.add(
             Dropdown(on_change=self._on_brush_selected, name="brush_picker")
@@ -920,18 +932,9 @@ class UIRoot(Container):
         self.layer_list.drag_rows = self._dragged_rows
         self.layers.add(self.layer_list, height=None)
 
-        # Under the list, above the order buttons: the active layer's pattern,
-        # drawn from a row spec the same way the brush popovers are. It
-        # is the one place a procedural is edited after it has been added.
-        self.properties = PropertyPanel(name="layer_properties")
-        # The same box the list is drawn into, so the two read as one panel.
-        self.properties.background = "BOX_INNER"
-        self.properties.on_change = self._on_layer_prop
-        self.properties.on_action = self._on_layer_prop_action
-        self.layers.add(self.properties, height=0)
-        self._properties_index = len(self.layers.child_heights) - 1
-        self._properties_height = 0
-
+        # Straight under the list, above the properties: the order buttons
+        # act on the list, so they sit against it rather than under a
+        # properties section whose height comes and goes (user request).
         order_row = Row(item_width=self.ICON_BUTTON, name="order_buttons")
         order_row.add(
             LayerIconButton(
@@ -951,6 +954,18 @@ class UIRoot(Container):
         )
         self.order_row = order_row
         self.layers.add(order_row, height=self.ICON_BUTTON)
+
+        # Under the order buttons: the active layer's pattern, drawn from a
+        # row spec the same way the brush popovers are. It is the one
+        # place a procedural is edited after it has been added.
+        self.properties = PropertyPanel(name="layer_properties")
+        # The same box the list is drawn into, so the two read as one panel.
+        self.properties.background = "BOX_INNER"
+        self.properties.on_change = self._on_layer_prop
+        self.properties.on_action = self._on_layer_prop_action
+        self.layers.add(self.properties, height=0)
+        self._properties_index = len(self.layers.child_heights) - 1
+        self._properties_height = 0
 
         # What the viewport is looking at. In the header, not along the
         # bottom: Blender's asset shelf owns the bottom edge, and a strip of
@@ -1186,27 +1201,20 @@ class UIRoot(Container):
             self.procedural_button.tooltip = self._procedural_tooltip()
             self.needs_redraw = True
 
-    def _on_procedural_clicked(self, button):
-        """Which pattern. A menu, because a pattern is a family.
+    def _on_procedural_clicked(self, _button):
+        """One click, one Custom pattern -- no menu to pick from.
 
-        This was briefly a plain "add one and pick it afterwards" button, on
-        the reasoning that a choice belongs beside the parameters it
-        changes. That reasoning holds for a *filter*, where the parameters are
-        all that differ. It does not hold here: Gradient, Noise, Checker and
-        Custom are four different things to make, not four settings of one,
-        and the button that makes them has to say so before it makes one.
+        The pattern registry is narrowed to Custom by the window, so there is
+        nothing left to choose. Where it goes follows the selected half: with
+        the mask selected the pattern lands on the mask as an effect, which is
+        what asking for a procedural "on the mask" means; otherwise it is a
+        new procedural layer.
         """
-        if not self._procedural_kinds:
-            self._emit(self.on_procedural_add, "")
-            return
-
-        self.menu.open_at(
-            button.x, button.y, list(self._procedural_kinds),
-            self._on_procedural_choice, title="Procedural Layer", above=True,
-        )
-
-    def _on_procedural_choice(self, identifier):
-        self._emit(self.on_procedural_add, identifier)
+        kind = self._procedural_kinds[0][0] if self._procedural_kinds else ""
+        if self._active_exists and self._active_part == 'MASK':
+            self._emit(self.on_effect_add, 'PATTERN', kind)
+        else:
+            self._emit(self.on_procedural_add, kind)
 
     def set_adjustment_kinds(self, kinds):
         """The adjustment registry, as the menu the button opens."""
@@ -1220,9 +1228,8 @@ class UIRoot(Container):
             self.needs_redraw = True
 
     def _procedural_tooltip(self):
-        count = len(self._procedural_kinds)
-        return (f"Add a procedural layer ({count} patterns)"
-                if count else "Add a procedural layer")
+        return ("Add a custom procedural layer, "
+                "or a custom pattern on the selected mask")
 
     def _on_adjustment_clicked(self, button):
         """Which adjustment. A menu, for the same reason patterns get one.
@@ -1313,16 +1320,14 @@ class UIRoot(Container):
           parameters, so the choice belongs beside them.
         * **Paint** is an image of its own, brushed by hand. Nothing to
           choose: it is one thing, and what it becomes is painted.
-        * **Procedural** generates a pattern and blends it in. That one *is*
-          asked up front, for the same reason the Procedural Layer button asks
-          -- four different things to make, not four settings of one.
+
+        A pattern on the mask is not here: the Procedural button puts a Custom
+        one there when the mask is the selected half.
         """
         if not self._active_exists or self._active_part == 'NONE':
             return
 
         items = [('FILTER', "Filter"), ('PAINT', "Paint")]
-        if self._procedural_kinds:
-            items.append(('PATTERN', "Procedural..."))
 
         self.menu.open_at(
             button.x, button.y, items, self._on_effect_choice,
@@ -1332,22 +1337,6 @@ class UIRoot(Container):
     def _on_effect_choice(self, identifier):
         if identifier in ('FILTER', 'PAINT'):
             self._emit(self.on_effect_add, identifier, "")
-            return
-
-        if identifier != 'PATTERN':
-            return
-
-        # A second menu rather than a submenu, the same shape the colour tags
-        # use: one level of nesting is all this needs, and a submenu that
-        # opens sideways has edges to get right that a reopened menu does not.
-        self.menu.open_at(
-            self.effect_button.x, self.effect_button.y,
-            list(self._procedural_kinds), self._on_effect_pattern_choice,
-            title=self._effect_title(), above=True,
-        )
-
-    def _on_effect_pattern_choice(self, identifier):
-        self._emit(self.on_effect_add, 'PATTERN', identifier)
 
     def _on_group_clicked(self, _button):
         if self._multi_select:
@@ -1746,6 +1735,7 @@ class UIRoot(Container):
         """
         available = info is not None
         info = info or {}
+        self._brush_available = available
 
         for widget in self._brush_widgets():
             if widget.enabled != available:
@@ -2883,6 +2873,13 @@ class UIRoot(Container):
             self._open_fill_picker(index)
             return
 
+        # The same gesture on a Custom pattern's chip opens what that chip
+        # stands for: the node group, in the shader graph.
+        if zone == 'CONTENT' and row.get("type") == 'PROCEDURAL' \
+                and row.get("kind") == 'CUSTOM':
+            self._emit(self.on_layer_edit_nodes, self._layer_index(index))
+            return
+
         if zone != 'NAME':
             return
 
@@ -3292,8 +3289,11 @@ class UIRoot(Container):
                               self._brush_panel_width)
         # The panel describes a brush, so it goes with the brush strip: a fill
         # tool's strip has no switch for it, and a panel nothing on screen can
-        # close is a panel the user is stuck with.
-        brush_visible = brush_open and not self.is_fill_tool
+        # close is a panel the user is stuck with. The same holds while the
+        # strip is dimmed for want of a paintable layer -- its switch is dim
+        # too -- so the panel steps aside and comes back with the target.
+        brush_visible = brush_open and not self.is_fill_tool \
+            and self._brush_available
 
         width = getattr(ui_state, "right_panel_width", self._layers_width)
         visible = getattr(ui_state, "show_right_panel", True)
@@ -3348,8 +3348,12 @@ class UIRoot(Container):
                 widget.visible = visible
                 self.needs_redraw = True
 
-    def _layout_brush_strip(self, control_y, control_h, pad, gap):
-        """Blender's tool header, in our own widgets."""
+    def _layout_brush_strip(self, control_y, control_h, start, pad, gap):
+        """Blender's tool header, in our own widgets.
+
+        Laid out from `start` -- `pad`, less however far the strip is
+        scrolled -- and returns the right edge of the last control.
+        """
         self._show(self._fill_widgets(), False)
         self._show((self.brush_color, self.brush_secondary, self.brush_swap),
                    True)
@@ -3357,7 +3361,7 @@ class UIRoot(Container):
         swatch_w = self.px(self.BRUSH_SWATCH)
         pressure_w = self.px(self.BRUSH_PRESSURE_WIDTH)
 
-        cursor = pad
+        cursor = start
         for widget, width in (
             (self.brush_picker, self.px(self.BRUSH_PICKER_WIDTH)),
             (self.brush_blend, self.px(self.BRUSH_BLEND_WIDTH)),
@@ -3401,11 +3405,11 @@ class UIRoot(Container):
         # Last, where Options was. It opens the panel that holds every one of
         # the popovers to its left, so it belongs at the end of them.
         self.brush_panel_button.visible = True
-        self.brush_panel_button.set_rect(
-            cursor, control_y, self.px(self.BRUSH_PROPERTIES_WIDTH), control_h
-        )
+        width = self.px(self.BRUSH_PROPERTIES_WIDTH)
+        self.brush_panel_button.set_rect(cursor, control_y, width, control_h)
+        return cursor + width
 
-    def _layout_fill_strip(self, control_y, control_h, pad, gap):
+    def _layout_fill_strip(self, control_y, control_h, start, pad, gap):
         """The three fill tools' strip. Laid out in the brush strip's rhythm.
 
         Same order, same spacing and the same colour swatches, so switching
@@ -3423,7 +3427,7 @@ class UIRoot(Container):
         swatch_w = self.px(self.BRUSH_SWATCH)
         pressure_w = self.px(self.BRUSH_PRESSURE_WIDTH)
 
-        cursor = pad
+        cursor = start
         if has_scope:
             width = self.px(self.FILL_SCOPE_WIDTH)
             self.fill_scope.set_rect(cursor, control_y, width, control_h)
@@ -3454,9 +3458,77 @@ class UIRoot(Container):
         self.fill_mode_row.set_rect(cursor, control_y, width, control_h)
         cursor += width + pad
 
-        self.fill_options.set_rect(
-            cursor, control_y, self.px(self.FILL_OPTIONS_WIDTH), control_h
-        )
+        width = self.px(self.FILL_OPTIONS_WIDTH)
+        self.fill_options.set_rect(cursor, control_y, width, control_h)
+        return cursor + width
+
+    def _layout_strip(self):
+        """Lay the settings strip out at its current scroll, clamped.
+
+        The strip is wider than a window with the shader graph open beside
+        it. Rather than clipping what does not fit, it scrolls -- the way
+        Blender's own headers do -- and the scroll is clamped so the last
+        control can come to the right edge and no further.
+        """
+        pad = self.px(theme.PAD)
+        gap = self.px(theme.GAP)
+        bar = self.brush_bar
+        control_h = self.px(theme.BUTTON_HEIGHT)
+        control_y = bar.y + (bar.height - control_h) // 2
+        layout = (self._layout_fill_strip if self.is_fill_tool
+                  else self._layout_brush_strip)
+
+        for _attempt in range(2):
+            right = layout(control_y, control_h, pad - self._strip_scroll,
+                           pad, gap)
+            self._strip_content = right + self._strip_scroll + pad
+            limit = self.strip_max_scroll()
+            clamped = min(max(0, self._strip_scroll), limit)
+            if clamped == self._strip_scroll:
+                break
+            self._strip_scroll = clamped
+
+    def strip_max_scroll(self):
+        """How far the strip can scroll: zero while it fits."""
+        return max(0, int(self._strip_content - self.brush_bar.width))
+
+    def scroll_strip(self, delta):
+        """Slide the strip by `delta` pixels (positive shows more on the
+        right). True when it moved."""
+        target = min(max(0, int(self._strip_scroll + delta)),
+                     self.strip_max_scroll())
+        if target == self._strip_scroll:
+            return False
+        self._strip_scroll = target
+        self._layout_strip()
+        self.needs_redraw = True
+        return True
+
+    def _handle_strip_scroll(self, event):
+        """Wheel and middle-drag over the strip scroll it. True if taken."""
+        if self._strip_drag is not None:
+            if event.is_move:
+                self.scroll_strip(self._strip_drag - event.mouse_x)
+                self._strip_drag = event.mouse_x
+                return True
+            if event.type == 'MIDDLEMOUSE' and event.is_release:
+                self._strip_drag = None
+                return True
+
+        if not self.brush_bar.contains(event.mouse_x, event.mouse_y):
+            return False
+        if self.strip_max_scroll() <= 0:
+            return False
+
+        if event.wheel:
+            # Down shows what is to the right, the way Blender's header
+            # scrolls -- one control's worth per notch.
+            self.scroll_strip(-event.wheel * self.px(self.STRIP_SCROLL_STEP))
+            return True
+        if event.type == 'MIDDLEMOUSE' and event.is_press:
+            self._strip_drag = event.mouse_x
+            return True
+        return False
 
     def on_resize(self):
         pad = self.px(theme.PAD)
@@ -3547,14 +3619,7 @@ class UIRoot(Container):
         bar_h = self.px(self.BRUSH_BAR_HEIGHT)
         bar_y = top - bar_h
         self.brush_bar.set_rect(0, bar_y, self.width, bar_h)
-
-        control_h = self.px(theme.BUTTON_HEIGHT)
-        control_y = bar_y + (bar_h - control_h) // 2
-
-        if self.is_fill_tool:
-            self._layout_fill_strip(control_y, control_h, pad, gap)
-        else:
-            self._layout_brush_strip(control_y, control_h, pad, gap)
+        self._layout_strip()
 
         # --- the tool row, under the strip ----------------------------------
         tool_h = self.px(self.TOOL_BAR_HEIGHT)
@@ -3749,6 +3814,10 @@ class UIRoot(Container):
         """
         if self._overlay is not None:
             return True
+        # A middle-drag that began on the strip keeps scrolling it wherever
+        # the pointer goes; the viewport under it must not start panning.
+        if self._strip_drag is not None:
+            return True
 
         if not (0 <= mouse_x < self.width and 0 <= mouse_y < self.height):
             return True
@@ -3895,6 +3964,9 @@ class UIRoot(Container):
         # written here: a binding added by hand used to eat an older one
         # without either of them saying so.
         if event.is_press and self._handle_key(event):
+            return True
+
+        if self._handle_strip_scroll(event):
             return True
 
         if event.is_move:

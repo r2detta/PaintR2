@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 230" width="640" height="230" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8a8f98"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="640" height="230" rx="12" fill="#ffffff"/>
+  <text x="140" y="22" font-size="14" fill="#57606a" text-anchor="middle">Layer stack (top to bottom)</text>
+  <g font-size="14">
+    <rect x="20" y="36" width="240" height="34" rx="6" fill="#ede9fe" stroke="#8b5cf6"/>
+    <text x="36" y="58" fill="#4c1d95">Adjustment · Levels</text>
+    <rect x="20" y="76" width="240" height="34" rx="6" fill="#fef3c7" stroke="#d97706"/>
+    <text x="36" y="98" fill="#78350f">Paint · details</text>
+    <rect x="238" y="84" width="14" height="18" rx="3" fill="#ffffff" stroke="#78350f"/>
+    <rect x="20" y="116" width="240" height="34" rx="6" fill="#dcfce7" stroke="#16a34a"/>
+    <text x="36" y="138" fill="#14532d">Procedural · your node group</text>
+    <rect x="20" y="156" width="240" height="34" rx="6" fill="#e0f2fe" stroke="#0284c7"/>
+    <text x="36" y="178" fill="#0c4a6e">Fill · base colour</text>
+  </g>
+  <text x="140" y="214" font-size="12" fill="#57606a" text-anchor="middle">blend mode · opacity · mask per layer</text>
+  <line x1="275" y1="113" x2="365" y2="113" stroke="#8a8f98" stroke-width="2" marker-end="url(#a)"/>
+  <text x="320" y="103" font-size="13" fill="#57606a" text-anchor="middle">bake</text>
+  <rect x="380" y="48" width="130" height="130" rx="8" fill="#f3f4f6" stroke="#8a8f98" stroke-width="1.5"/>
+  <rect x="396" y="64" width="98" height="98" rx="4" fill="#c7a17a"/>
+  <rect x="396" y="64" width="49" height="49" fill="#b98d62"/>
+  <rect x="445" y="113" width="49" height="49" fill="#b98d62"/>
+  <text x="445" y="200" font-size="14" fill="#24292f" text-anchor="middle" font-weight="600">Material_basecolor.png</text>
+</svg>

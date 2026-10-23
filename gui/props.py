@@ -93,6 +93,8 @@ class PropertyPanel(Widget):
     PADDING = 8
     SPLIT = 0.4
     INDENT = 10
+    # Inset of a sub-panel's contents from the lighter box drawn behind it.
+    SUBPANEL_PAD = 4
     SEPARATOR = 6
 
     # A suffix toggle is square, so it is as tall as the row it sits on.
@@ -167,7 +169,7 @@ class PropertyPanel(Widget):
 
     # --- geometry ---------------------------------------------------------
 
-    def row_height(self, row):
+    def row_height(self, row, depth=0):
         kind = row.get("kind")
         if kind == 'separator':
             return self.px(self.SEPARATOR)
@@ -178,20 +180,22 @@ class PropertyPanel(Widget):
         if kind == 'panel':
             height = self.px(self.ROW_HEIGHT)
             if self.is_open(row):
-                inner = self.measure(row.get("rows") or ())
+                inner = self.measure(row.get("rows") or (), depth + 1)
                 if inner:
                     height += self.px(self.ROW_GAP) + inner
+                    if depth:
+                        height += self.px(self.SUBPANEL_PAD)
             return height
         return self.px(self.ROW_HEIGHT)
 
-    def measure(self, rows):
+    def measure(self, rows, depth=0):
         """Total height of `rows` in device pixels, gaps included."""
         gap = self.px(self.ROW_GAP)
         total = 0
         for index, row in enumerate(rows):
             if index:
                 total += gap
-            total += self.row_height(row)
+            total += self.row_height(row, depth)
         return total
 
     def content_height(self):
@@ -265,16 +269,19 @@ class PropertyPanel(Widget):
         indent = self.px(self.INDENT)
 
         for row in rows:
-            height = self.row_height(row)
+            height = self.row_height(row, depth)
             if row.get("kind") == 'panel':
                 header = self.px(self.ROW_HEIGHT)
                 out.append((row, (x, top - header, width, header), depth))
                 if self.is_open(row):
+                    # A sub-panel's rows stay clear of the right edge of the
+                    # box drawn behind them; see `_draw_subpanel_backs`.
+                    inset = self.px(self.SUBPANEL_PAD) if depth else 0
                     self._place(
                         row.get("rows") or (),
                         x + indent,
                         top - header - gap,
-                        width - indent,
+                        width - indent - inset,
                         depth + 1,
                         out,
                     )
@@ -406,7 +413,9 @@ class PropertyPanel(Widget):
 
     def draw(self):
         if self.background is None:
-            for row, rect, depth in self.placed():
+            placed = self.placed()
+            self._draw_subpanel_backs(placed)
+            for row, rect, depth in placed:
                 self._draw_row(row, rect, depth)
             return
 
@@ -419,11 +428,34 @@ class PropertyPanel(Widget):
         draw.rounded_rect(self.x, self.y, self.width, self.height, radius,
                           getattr(theme, self.background, theme.BOX_INNER))
         with draw.clip(self.x, self.y, self.width, self.height):
-            for row, rect, depth in self.placed():
+            placed = self.placed()
+            self._draw_subpanel_backs(placed)
+            for row, rect, depth in placed:
                 self._draw_row(row, rect, depth)
         draw.rounded_rect_outline(self.x, self.y, self.width, self.height,
                                   radius, theme.OUTLINE)
         self._draw_scrollbar()
+
+    def _draw_subpanel_backs(self, placed):
+        """A lighter box behind every open sub-panel, header to last row.
+
+        Without it a sub-panel's rows and the rows after it are the same grey
+        and the same indent apart, so a setting below a group -- Margin under
+        Thickness -- reads as part of that group. Top-level panels are left
+        alone: they are the page, not a group on it. A translucent wash, so
+        a sub-panel inside a sub-panel comes out lighter still.
+        """
+        for row, rect, depth in placed:
+            if row.get("kind") != 'panel' or not depth or not self.is_open(row):
+                continue
+            x, y, width, height = rect
+            full = self.row_height(row, depth)
+            top = y + height
+            draw.rounded_rect(
+                x, top - full, width, full,
+                theme.radius(full, self.ui_scale, theme.PANEL_ROUNDNESS),
+                theme.SUBPANEL_BACK,
+            )
 
     def _draw_scrollbar(self):
         """The same bar the layer list has, for the same reason: without it a

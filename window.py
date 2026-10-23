@@ -1481,6 +1481,12 @@ def _brush_info(context):
     if brush is None:
         return None
 
+    # The fill strip's rule, now the brush strip's too: with nothing the brush
+    # could land in -- a Fill layer's colour, a procedural, a group -- every
+    # control here would change settings for a stroke that cannot happen.
+    if paint.active_paint_image(context) is None:
+        return None
+
     return {
         "brushes": brushes.available(),
         "brush": brushes.active_identifier(context),
@@ -2219,6 +2225,8 @@ def _scene_rows(context):
             "label": f"{len(models)} model(s) in {paintset.PAINT}",
             "active": bool(models),
         },
+        _row('display', "solo_active", text="Show Selected Only",
+             context=context),
         _row('display', "fade_inactive", text="Dim Other Models",
              context=context),
     ]
@@ -2254,7 +2262,6 @@ def _scene_rows(context):
 
 def _shader_rows(context):
     """The Shader block: how this material's stack is put on the surface."""
-    from . import document as doc
     from . import paint
 
     document = paint.active_document(context)
@@ -2266,22 +2273,6 @@ def _shader_rows(context):
         }]
 
     rows = [_row('doc', "shader_mode", label="Mode", context=context)]
-
-    if document.shader_mode == 'CHANNEL':
-        # Only the channels this material actually carries. Offering the other
-        # three would be offering a black model with no explanation.
-        active = document.active_channels()
-        rows.append({
-            "kind": 'enum',
-            "owner": 'doc',
-            "key": "preview_channel",
-            "label": "Channel",
-            "desc": "Which channel the Channel mode shows",
-            "value": document.preview_target() or document.preview_channel,
-            "items": [(c, doc.channel_label(c)) for c in active],
-            "active": bool(active),
-            "suffix": [],
-        })
 
     rows.append(_separator())
     # The other half of "show me the colour I painted": an unlit surface still
@@ -2323,8 +2314,16 @@ def _map_rows(context):
         # which of them get maps, and whether they shadow one another.
         _row('scene', "bake_models", label="Bake", context=context),
         _row('scene', "bake_occluders", label="Occlusion", context=context),
+        # Settings of the bake as a whole, up here with the others, so the
+        # only rows below the map checkboxes are each map's own panel.
+        _row('scene', "bake_margin", label="Margin", context=context),
+        _row('scene', "bake_margin_type", label="", context=context),
         _separator(),
+        _row('scene', "use_highpoly_bake", context=context),
     ]
+    if props.use_highpoly_bake:
+        rows.extend(_highpoly_rows(context, obj))
+    rows.append(_separator())
 
     # Which maps, as their own checkboxes -- and a map that cannot be produced
     # right now is drawn dim rather than hidden, so the reason it will not
@@ -2372,7 +2371,7 @@ def _map_rows(context):
             "rows": _compact([
                 # The one AO setting both bakers read, so it sits above the
                 # "External baker only" note. Same property as the Samples row
-                # under the panels, which Thickness shares.
+                # in the Thickness panel: one count of rays, shared by both.
                 _row('scene', "mesh_map_samples", label="Samples",
                      context=context),
                 None if use_external else {
@@ -2422,22 +2421,22 @@ def _map_rows(context):
             ]),
         })
 
-    rows.append(_separator())
-    rows.append(_row('scene', "mesh_map_samples", label="Samples", context=context))
-    rows.append(_row('scene', "bake_margin", label="Margin", context=context))
-    rows.append(_row('scene', "bake_margin_type", label="", context=context))
-
-    rows.append(_separator())
-    rows.append(_row('scene', "use_highpoly_bake", context=context))
-    if props.use_highpoly_bake:
-        from . import paintset
-
-        collection, note = paintset.status(obj)
+    # Thickness is the other map that traces rays, so the samples it shares
+    # with AO are found under its own name too -- not in a row of their own
+    # below the panels, where they read like a setting of every map.
+    if props.bake_map_thickness:
         rows.append({
-            "kind": 'label',
-            "label": f"{collection}  {note}".strip() or "No pair",
-            "active": bool(collection),
+            "kind": 'panel',
+            "key": "bake_thickness",
+            "label": "Thickness",
+            "open": False,
+            "rows": [
+                _row('scene', "mesh_map_samples", label="Samples",
+                     context=context),
+            ],
         })
+
+    rows.append(_separator())
 
     # What stops the bake, said before the button rather than after it.
     problem = ""
@@ -2483,6 +2482,81 @@ def _map_rows(context):
         })
 
     return _compact(rows)
+
+
+def _highpoly_rows(context, obj):
+    """What a high-poly bake needs, under the Highpoly Bake toggle.
+
+    The pairing, what the active model resolved to, and the cage -- the
+    settings the sidebar used to carry. The status line comes first and stays
+    outside the panel: a high-poly bake that quietly does nothing is the
+    failure it exists to prevent, so it is not something to fold away.
+    """
+    from . import paintset
+
+    props = context.scene.paintr2
+    suffix = props.highpoly_suffix
+
+    collection, note = paintset.status(obj, suffix)
+    rows = [{
+        "kind": 'label',
+        "label": f"{collection}  {note}".strip() or "No pair",
+        "active": bool(collection),
+    }]
+
+    from .ops import op_meshmaps
+
+    settings = [
+        _row('scene', "highpoly_suffix", label="Suffix", context=context),
+        # No button makes the pair: Set Models makes the high collection
+        # beside the paint one, and the rest is naming.
+        {"kind": 'label', "label": f"High-polys go in {paintset.HIGH},",
+         "active": False},
+        {"kind": 'label', "label": f"named <model>{suffix}",
+         "active": False},
+        _separator(),
+        _row('scene', "cage_extrusion", context=context),
+        _row('scene', "max_ray_distance", context=context),
+        _row('scene', "cage_safety", context=context),
+        {
+            "kind": 'button',
+            "label": "Measure Cage",
+            "desc": "Measure the pairs and fill in Extrusion and Max Ray "
+                    "Distance",
+            "action": ('measure_cage',),
+            "active": bool(op_meshmaps._selected_meshes(context)),
+        },
+    ]
+
+    if props.measured_outward >= 0.0:
+        # The readings, not the settings: they are what turn the two fields
+        # above from magic numbers into a decision.
+        settings.append({
+            "kind": 'label',
+            "label": f"Measured out  {props.measured_outward:.4f} m",
+            "active": False,
+        })
+        settings.append({
+            "kind": 'label',
+            "label": f"Measured in   {props.measured_inward:.4f} m",
+            "active": False,
+        })
+
+    if props.bake_map_normal:
+        settings.append(_separator())
+        settings.append(_row('scene', "normal_flip_green", context=context))
+    if props.bake_map_height:
+        settings.append(_separator())
+        settings.append(_row('scene', "height_range", context=context))
+
+    rows.append({
+        "kind": 'panel',
+        "key": "bake_highpoly",
+        "label": "Highpoly & Cage",
+        "open": False,
+        "rows": _compact(settings),
+    })
+    return rows
 
 
 def _display_rows(context):
@@ -2575,11 +2649,7 @@ def _export_dialog_rows(context):
 
     Every row is a scene property, so the dialog writes through the same
     channel every other panel does and the settings are still there next time.
-    The channel switches are filtered to what the models actually carry: a
-    tick for a channel no material has is not a choice, it is a lie.
     """
-    from . import document as doc
-
     scene = getattr(context, "scene", None)
     if scene is None:
         return []
@@ -2592,33 +2662,10 @@ def _export_dialog_rows(context):
         _separator(),
         _row('scene', "export_active_only", label="", text="Active Model Only",
              context=context),
-        _separator(),
     ]
 
-    targets, _channels = _export_targets(context)
-
-    # Which channels are on offer is the union of what the models carry --
-    # every one of them is a file somebody might want, and a channel only one
-    # of two models has is still a channel that model exports.
-    offered = []
-    for obj in targets:
-        from . import bake as bake_mod
-
-        for material in bake_mod.paint_materials(obj):
-            for identifier in material.paintr2.active_channels():
-                if identifier not in offered:
-                    offered.append(identifier)
-
-    if offered:
-        rows.append({"kind": 'label', "label": "Channels", "active": True})
-        for identifier in doc.CHANNEL_IDS:
-            if identifier not in offered:
-                continue
-            rows.append(_row(
-                'scene', "export_" + identifier.lower(), label="",
-                text=doc.channel_label(identifier), context=context,
-            ))
-
+    # No channel ticks: Base Color is the only channel, and it is what
+    # every export writes.
     return _compact(rows)
 
 
@@ -2752,6 +2799,9 @@ def _display_action(action, *args):
 
     elif action == 'bake_maps':
         _bake_mesh_maps()
+
+    elif action == 'measure_cage':
+        _run("measure cage", bpy.ops.paintr2.measure_cage)
 
     elif action == 'browse':
         # ('browse', owner, key) from a path row. One destination so far, and
@@ -4243,6 +4293,9 @@ def _brush_panels(context):
     brush = paint.active_brush(context)
     if brush is None:
         return None
+    # Same rule as `_brush_info`: no paintable target, no brush settings.
+    if paint.active_paint_image(context) is None:
+        return None
 
     builders = (
         ('BRUSH', "Brush", _brush_panel_rows),
@@ -5077,6 +5130,32 @@ def _layer_panel_action(action, *_args):
     _show_node_tree(proc.node_tree)
 
 
+def _edit_layer_nodes(index):
+    """A Custom layer's chip double-clicked: open that layer's group.
+
+    The row's own layer, not the active one -- the chip is on the row. A
+    group that is missing (the kind was switched to Custom from the dropdown)
+    is made first, so the button always opens on something.
+    """
+    from . import paint
+    from . import procedural
+
+    document = paint.active_document()
+    if document is None or not (0 <= index < len(document.layers)):
+        return
+    layer = document.layers[index]
+    if layer.layer_type != 'PROCEDURAL' or \
+            not procedural.edits_in_graph(layer.procedural.kind):
+        return
+
+    tree = layer.procedural.node_tree
+    if tree is None:
+        tree = procedural.ensure_custom_tree(
+            layer.procedural, document.id_data, layer.name
+        )
+    _show_node_tree(tree)
+
+
 def _add_adjustment(kind=""):
     """An empty kind means "the default" -- it is picked in the properties."""
     from . import adjustment
@@ -5091,11 +5170,10 @@ def _add_adjustment(kind=""):
 
 def _add_procedural(kind=""):
     from . import paint
-    from . import procedural
 
     _leave_mask_view()
     _run("add procedural", bpy.ops.paintr2.procedural_add,
-         kind=kind or procedural.KINDS[0][0])
+         kind=kind or 'CUSTOM')
     paint.auto_sync_mode()
 
 
@@ -5600,8 +5678,11 @@ def _make_root():
         # arithmetic behind it, plus MIX which always has one.
         scalar_only={'MIX', *_SCALAR_BLEND},
     )
+    # Only Custom is offered for new patterns. The other kinds stay in the
+    # registry so documents that already carry them keep loading and baking.
     root.set_procedural_kinds(
-        [(item[0], item[1]) for item in PROCEDURAL_KINDS]
+        [(item[0], item[1]) for item in PROCEDURAL_KINDS
+         if item[0] == 'CUSTOM']
     )
 
     from .adjustment import KINDS as ADJUSTMENT_KINDS
@@ -5630,6 +5711,7 @@ def _make_root():
     root.on_fill_undo = _fill_undo
     root.on_panel_width = _set_panel_width
     root.on_layer_move = _move_layer
+    root.on_layer_edit_nodes = _edit_layer_nodes
     root.on_layer_reorder = _reorder_layer
     root.on_layer_rename = _rename_layer
     root.on_blend_change = _set_blend

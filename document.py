@@ -76,30 +76,20 @@ BLEND_MODES = (
 )
 
 # The channels a document can carry, in the order everything uses them: the
-# panel, the compiler, the export. A fixed tuple rather than a collection --
-# the channel set is not the user's to extend, and adding AO or Opacity later
-# is one line here plus one branch in the material wiring.
+# panel, the compiler, the export. Base Color only, for now: Roughness,
+# Metallic, Normal and Height were taken out until there is a consistent way
+# to do them. The table is kept so that putting a channel back is a row here
+# plus its wiring.
 #
 # `kind` decides which field of PR2_LayerChannel is read and which socket the
 # group output gets. `default` is what a channel reads where no layer
 # contributes -- the compiler's backdrop.
-#
-# Height's default is 0.5 and that is the whole of its convention: **0.5 is
-# flat**, below it is a dent and above it is a bump. Storing it signed around
-# zero was tried and is wrong twice over -- the value property is 0..1, so a
-# dent was clamped away before it reached the compiler, and an unsigned PNG
-# cannot carry a negative anyway, so the exported map came out black. Half is
-# also what every engine expects to read.
 #
 # `colorspace` and `float_buffer` are the measured export rules: a PNG's
 # bit depth comes from the image buffer, not from any save setting, and a
 # Non-Color target is the difference between writing 0.31 and writing 0.60.
 CHANNELS = (
     ('BASE_COLOR', "Base Color", 'COLOR', (0.8, 0.8, 0.8, 1.0), 'sRGB', False),
-    ('ROUGHNESS', "Roughness", 'FLOAT', 0.5, 'Non-Color', False),
-    ('METALLIC', "Metallic", 'FLOAT', 0.0, 'Non-Color', False),
-    ('NORMAL', "Normal", 'COLOR', (0.5, 0.5, 1.0, 1.0), 'Non-Color', True),
-    ('HEIGHT', "Height", 'FLOAT', 0.5, 'Non-Color', True),
 )
 
 CHANNEL_IDS = tuple(entry[0] for entry in CHANNELS)
@@ -137,8 +127,8 @@ def channel_float(identifier):
     """True for a channel whose 8 bits are visibly not enough.
 
     Measured: a PNG's bit depth comes from the image buffer alone, so this is
-    the whole of the 16-bit decision -- Normal breaks along its gradients and
-    Height bands into steps at 8 bits.
+    the whole of the 16-bit decision. No channel needs it today; Normal and
+    Height did.
     """
     entry = channel_entry(identifier)
     return bool(entry[5]) if entry else False
@@ -177,7 +167,7 @@ def _layer_index(owner):
     """Which layer `owner` belongs to, or -1.
 
     Read off the RNA path rather than by searching the collection: the path is
-    `paintr2.layers[7]` (or `paintr2.layers[7].ch_roughness`) and the number in
+    `paintr2.layers[7]` (or `paintr2.layers[7].ch_base_color`) and the number in
     it is the answer, which makes this a regex match instead of a walk down a
     hundred layers on every write.
     """
@@ -372,10 +362,6 @@ class PR2_Layer(PropertyGroup):
     # colour is now `layer.channel('BASE_COLOR').color`.
 
     ch_base_color: PointerProperty(type=PR2_LayerChannel)
-    ch_roughness: PointerProperty(type=PR2_LayerChannel)
-    ch_metallic: PointerProperty(type=PR2_LayerChannel)
-    ch_normal: PointerProperty(type=PR2_LayerChannel)
-    ch_height: PointerProperty(type=PR2_LayerChannel)
 
     def channel(self, identifier):
         """This layer's record for one channel. The single access point."""
@@ -609,61 +595,14 @@ class PR2_Document(PropertyGroup):
     layers: CollectionProperty(type=PR2_Layer)
 
     # --- channels ------------------------------------------------------------
-    # Which channels this material has at all. Two levels of switch exist and
-    # they mean different things:
-    #
-    #   document.use_*        does this material have such a channel
-    #   layer.ch_*.enabled    does this layer contribute to it
-    #
-    # A channel switched off here is not compiled, not wired into Principled
-    # and not exported; the per-layer values it had are kept, so switching it
-    # back on returns what was there. Managed from the sidebar.
-    #
-    # Normal and Height start off: every material carrying a Bump chain it
-    # does not need is a cost paid for nothing.
+    # Which channels this material has at all. With Base Color the only one
+    # this is always on; it stays a property because `uses()` is the question
+    # the compiler and the export ask, and a second channel will need it
+    # answered per material again.
 
     use_base_color: BoolProperty(
         name="Base Color", default=True, update=_rewire,
         description="The painted colour of the surface",
-    )
-    use_roughness: BoolProperty(
-        name="Roughness", default=True, update=_rewire,
-        description="How rough the surface is: 0 is a mirror, 1 is chalk",
-    )
-    use_metallic: BoolProperty(
-        name="Metallic", default=True, update=_rewire,
-        description="Whether the surface behaves as a metal",
-    )
-    use_normal: BoolProperty(
-        name="Normal", default=False, update=_rewire,
-        description="A tangent-space normal map, for detail the mesh has not got",
-    )
-    use_height: BoolProperty(
-        name="Height", default=False, update=_rewire,
-        description="Surface relief, shaded through a Bump node",
-    )
-
-    # How far the Height channel pushes the surface, in scene units. Measured:
-    # the Bump node's response saturates around 0.05 and the useful range
-    # depends on the object's scale, so this has to be a control rather than a
-    # constant.
-    height_scale: FloatProperty(
-        name="Height Scale",
-        description="How far the Height channel displaces the shading normal",
-        default=0.02,
-        min=0.0,
-        soft_max=0.5,
-        precision=4,
-        update=_recompile,
-    )
-
-    normal_scale: FloatProperty(
-        name="Normal Scale",
-        description="Strength of the Normal channel",
-        default=1.0,
-        min=0.0,
-        max=4.0,
-        update=_recompile,
     )
 
     # --- how the stack is shown ----------------------------------------------
@@ -697,18 +636,19 @@ class PR2_Document(PropertyGroup):
     shader_mode: EnumProperty(
         name="Shader",
         description="How the compiled stack is shown on the model",
+        # Numbered, because a file stores the number: 3 was the Channel mode,
+        # and without the numbers Mesh Map would slide into its slot.
         items=(
-            ('PBR', "PBR", "Every channel through a Principled BSDF. The look "
-             "the material actually has"),
+            ('PBR', "PBR", "Base Color through a Principled BSDF. The look "
+             "the material actually has", 'NONE', 0),
             ('UNLIT', "Unlit", "Base Color straight to the output, with no "
              "light on it at all. What a colour really is, rather than what "
-             "the light is doing to it"),
+             "the light is doing to it", 'NONE', 1),
             ('DIFFUSE', "Diffuse", "Lit, but matte and flat: no metal, no "
-             "gloss, no relief. The form reads and the colour does not shift"),
-            ('CHANNEL', "Channel", "One channel on its own, as a grey image"),
+             "gloss. The form reads and the colour does not shift", 'NONE', 2),
             ('MESH_MAP', "Mesh Map", "A baked mesh map on the model, with no "
              "light and no layers. For checking a bake without leaving the "
-             "window"),
+             "window", 'NONE', 4),
         ),
         default='PBR',
         update=_rewire,
@@ -731,17 +671,6 @@ class PR2_Document(PropertyGroup):
         name="Mesh Map",
         description="The baked map the Mesh Map mode puts on the model",
         type=bpy.types.Image,
-        update=_rewire,
-    )
-
-    preview_channel: EnumProperty(
-        name="Preview",
-        description="Which channel the Channel mode shows",
-        items=[
-            (identifier, label, f"Show the {label} channel on its own")
-            for identifier, label, _kind, _default, _space, _float in CHANNELS
-        ],
-        default='BASE_COLOR',
         update=_rewire,
     )
 
@@ -867,20 +796,6 @@ class PR2_Document(PropertyGroup):
         if solo < index < self.subtree_end(solo):
             return True
         return index < solo < self.subtree_end(index)
-
-    def preview_target(self):
-        """The channel Channel mode should show, given what this material has.
-
-        The stored choice when the material carries it, otherwise the first
-        channel it does carry -- a preview of a channel that does not exist
-        is a black model and no explanation.
-        """
-        active = self.active_channels()
-        if not active:
-            return None
-        if self.preview_channel in active:
-            return self.preview_channel
-        return active[0]
 
     def uses(self, identifier):
         """True when this material carries `identifier` at all."""

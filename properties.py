@@ -270,6 +270,13 @@ def _fade_update(self, context):
     isolation.recompile_set()
 
 
+def _solo_update(self, context):
+    from . import isolation, session
+
+    isolation.sync_solo(context)
+    session.tag_redraw()
+
+
 class PR2_HiddenObject(PropertyGroup):
     """One object the session hid, by name.
 
@@ -400,6 +407,18 @@ class PR2_DisplaySettings(PropertyGroup):
         max=1.0,
         subtype='FACTOR',
         update=_fade_update,
+    )
+
+    # The stronger answer to the same question: the other models are not
+    # drawn at all. Plain viewport hiding, recorded with the isolation
+    # so closing the window or a crash cannot leave a model invisible.
+    solo_active: BoolProperty(
+        name="Show Selected Only",
+        description="Hide every other model in the set, so only the one being "
+        "painted is drawn. Switch models from the model list; the hidden ones "
+        "come back when this is turned off or the window closes",
+        default=False,
+        update=_solo_update,
     )
 
     # What was there before we took over. On the scene rather than in memory:
@@ -535,23 +554,14 @@ class PR2_SceneProps(PropertyGroup):
         default=False,
     )
 
-    # Which channels the export writes. A channel has to be both switched on
-    # for the material and ticked here -- the first says the material has it,
-    # the second says you want the file this time.
-    export_base_color: BoolProperty(name="Base Color", default=True)
-    export_roughness: BoolProperty(name="Roughness", default=True)
-    export_metallic: BoolProperty(name="Metallic", default=True)
-    export_normal: BoolProperty(name="Normal", default=True)
-    export_height: BoolProperty(name="Height", default=True)
-
     def export_channels(self, document):
-        """The channels to write for `document`, in CHANNELS order."""
-        from . import document as doc
+        """The channels to write for `document`, in CHANNELS order.
 
-        return [
-            identifier for identifier in document.active_channels()
-            if getattr(self, "export_" + identifier.lower(), True)
-        ]
+        Every channel the material carries. There used to be a tick per
+        channel here; with Base Color the only one a tick could only
+        mean "export nothing".
+        """
+        return list(document.active_channels())
 
     # --- mesh maps -----------------------------------------------------------
     # Their own resolution: a curvature or AO map does not need the size a

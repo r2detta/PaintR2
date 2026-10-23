@@ -8,14 +8,16 @@ can build layer logic in the shader, but a shader mix is not a file you can
 export. PaintR2 joins the two: paint in a stack of layers, take the result out
 as PNG or EXR.
 
+<p align="center"><img src=".github/readme/stack.svg" alt="A stack of fill, procedural, paint and adjustment layers baked into one Base Color texture" width="560"></p>
+
 ---
 
 > ### ⚠️ Under development
 >
 > PaintR2 is **still being built** and has not reached 1.0 (the current series
-> is `0.10.x`). What it does today is **simple-level** texture painting: a layer
-> stack, painting, fills, masks, and per-channel export. It is not a substitute
-> for a full material pipeline.
+> is `0.11.x`). What it does today is **simple-level** texture painting: a layer
+> stack, painting, fills, masks, and a **Base Color** export. It is not a
+> substitute for a full material pipeline.
 >
 > In practice that means:
 >
@@ -57,21 +59,21 @@ ln -s "$PWD/PaintR2" ~/.config/blender/5.2/extensions/user_default/PaintR2
 
 ## Quick start
 
+<p align="center"><img src=".github/readme/workflow.svg" alt="Select, Set Models, Open PaintR2, Paint, Export" width="820"></p>
+
 1. In the 3D viewport, select the mesh (or meshes) you want to paint.
 2. Press `N` to open the sidebar and switch to the **PaintR2** tab.
-3. Choose a resolution and a base colour, then press **Set Models**.
+3. Choose a resolution, then press **Set Models**.
    An object with no material gets one called `<object>_Paint`; an object that
    already has one **keeps the name but has the material reset in place** — so
    whatever was in that material is gone, and only its name survives.
-4. In the **Channels** panel, pick which channels this material carries
-   (Base Color, Roughness, Metallic, Normal, Height).
-5. Press **Open PaintR2**. The window switches to a PaintR2 workspace with the
+4. Press **Open PaintR2**. The window switches to a PaintR2 workspace with the
    layers and painting tools in it.
-6. When you are done, press **Export** in the top right to bake and write the
+5. When you are done, press **Export** in the top right to bake and write the
    textures, then **Close** to go back to the workspace and mode you came from.
 
-The sidebar is only for setting up; the actual work happens in the PaintR2
-workspace.
+The sidebar is only for setting up. Everything else — painting, mesh map
+baking, saving layer images and export — happens in the PaintR2 workspace.
 
 ---
 
@@ -100,22 +102,25 @@ workspace.
 - Its own undo ring (`Ctrl Z`)
 
 **Procedural and adjustment**
-- Gradient, Noise, Checker — as a layer or as a mask
-- Use your own node group as a layer
-- Adjustment layers: HSV, Levels, Bright/Contrast, Gamma, Invert
+- Your own node group as a layer or as a mask — and it can read the baked
+  mesh maps (AO, curvature, …) as inputs
+- Adjustment layers: HSV, Levels, Bright/Contrast, Gamma, Clamp, Posterize,
+  Invert
 - A per-layer effect stack
 
-**PBR and export**
-- Five channels: Base Color, Roughness, Metallic, Normal, Height
-- The right colour space and bit depth per channel; Normal and Height at 16 bit
-- Live Principled preview, with lighting and shading modes
-- Exported as a separate file per channel
+**Preview and export**
+- **Base Color** is the one channel for now; it is exported per material as
+  PNG, OpenEXR, Targa or JPEG
+- Preview modes: PBR, Unlit, Diffuse, and a baked mesh map on its own
+- Lighting, HDRI and view transform controls inside the workspace
 
-**Mesh map baking**
+**Mesh map baking** (in the workspace's **Bake** page)
 - Ambient Occlusion, Curvature, Thickness, Position
-- Normal, Height and Bent Normal from a high-poly
+- Normal, Height and Bent Normal from a high-poly, with a one-click cage
+  measurement
 - Bake every model or only the active one; choose whether the other models
   shadow a model's Ambient Occlusion or it is baked as if alone
+- Look at any baked map on the model with one click
 
 **Multiple objects and materials** — painted as one set, and exported together.
 
@@ -176,6 +181,9 @@ The release binaries are built by `.github/workflows/build.yml`.
   unrecoverable loss. If you started wrong, the way out is a new material.
 - **One PaintR2 session at a time.**
 - **No UDIM.** A single UV tile.
+- **Base Color only.** Roughness, Metallic, Normal and Height were taken out in
+  0.11 until they can be done properly; Metallic and Roughness are planned to
+  come back.
 - No smart materials or smart masks.
 
 
