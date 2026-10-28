@@ -326,6 +326,10 @@ def _draw_callback():
         # without our panel being involved; the fade follows it here.
         _follow_active_object(context)
 
+        state.root.sync_channels(*_channel_picker(context))
+        scene = getattr(context, "scene", None)
+        if scene is not None:
+            state.root.set_properties_height(scene.paintr2.ui.properties_height)
         state.root.sync_properties(_layer_panel_rows(context))
         state.root.sync_display(_display_rows(context))
 
@@ -510,11 +514,20 @@ def _layer_rows(context):
     # index it came from and the interface hands that number back.
     solo_mode, solo_index = document.solo_target()
 
+    from . import nodegen
+
+    # The rows show one channel's blend and opacity at a time.
+    channel = document.view_channel
+    blend_modes = nodegen.blend_modes_for(channel)
+
     rows = []
     index = 0
     while index < len(document.layers):
         layer = document.layers[index]
         written = layer.channel_ids()
+        # A group carries every channel of its children, so it always has a
+        # blend and an opacity to show.
+        present = layer.layer_type == 'GROUP' or layer.writes(channel)
         rows.append(
             {
                 "index": index,
@@ -533,14 +546,16 @@ def _layer_rows(context):
                 "color_effects": len(layer.effects),
                 "mask_effects": len(effects_mod.visible_stack(layer, True)),
                 "visible": layer.visible,
-                "blend": layer.blend_mode,
+                "blend": layer.channel_blend(channel),
+                "blend_modes": blend_modes,
+                "channel_absent": not present,
                 # True when every channel this layer writes to is a single
                 # number, so the blend menu can drop the modes that would
                 # quietly do nothing.
                 "scalar_only": bool(written) and not any(
-                    doc.channel_kind(c) == 'COLOR' for c in written
+                    doc.channel_is_color(c) for c in written
                 ),
-                "opacity": layer.opacity,
+                "opacity": layer.channel_opacity(channel),
                 "color": tuple(layer.channel('BASE_COLOR').color)
                 if layer.layer_type == 'FILL'
                 and layer.writes('BASE_COLOR') else None,
@@ -771,21 +786,39 @@ def _procedural_block(owner, proc, label, context, with_color):
     }
 
 
+# What a channel chip says. Short enough that five fit a 200-pixel column;
+# the full name is the chip's tooltip and the value row's label.
+_CHIP_LABELS = {
+    'BASE_COLOR': "Color",
+    'ROUGHNESS': "Rough",
+    'METALLIC': "Metal",
+    'NORMAL': "Nrm",
+    'HEIGHT': "Height",
+}
+
+
 def _channel_rows(context):
-    """The Channels block: what the active layer writes to, and with what.
+    """The Properties block: which channels the active layer writes to, and
+    the value it writes.
 
-    One row per channel the *document* carries (a channel the material has not
-    got is not a choice the layer has to make). The row's toggle is the
-    layer's own switch; its value is dimmed rather than hidden while the
-    toggle is off, because the value survives being switched off and coming
-    back is the whole point.
+    A row of chips first -- one per channel, pressed when the layer writes to
+    it -- then one value row per pressed chip, in CHANNELS order. Switching a
+    chip off keeps the value; switching it back on is the same layer again.
 
-    Two channels have no value to show and say so instead:
+    Blend mode and opacity are deliberately not here: they are on the layer
+    row, for the channel the picker shows. Two copies of one control are
+    two things to keep in step, and a fuller panel than anyone asked for.
 
-    * a PAINT layer's Base Color -- that comes from the image, not a swatch;
-    * any channel of a Custom pattern -- that comes from the node group.
+    What each channel's value row is:
 
-    Both are drawn as the plain checkbox their state actually is.
+    * Base Color -- the swatch on a Fill; "painted" on a Paint layer, whose
+      colour is its image; nothing on a pattern, whose colours are in the
+      Pattern block below.
+    * Roughness, Metallic, Height -- a slider. On a pattern it is how much:
+      the pattern times this value.
+    * Normal -- a swatch holding the normal as a colour, flat (0.5, 0.5, 1)
+      to begin with. Flat under Detail or Combine changes nothing; under
+      Normal it flattens what is beneath, inside the mask.
     """
     from . import document as doc
     from . import paint
@@ -796,55 +829,162 @@ def _channel_rows(context):
     if layer is None or layer.layer_type == 'GROUP':
         return []
 
-    # An adjustment layer has no channel of its own to set. What it does to a
-    # channel is decided by which adjustment it is, and the block below this
-    # one already names the channels its kind leaves alone -- so a Base Color
-    # swatch and a Roughness slider here were five controls that changed
-    # nothing. See `Layer.writes`.
-    if layer.layer_type == 'ADJUSTMENT':
-        return []
-
     if len(document.selected_indices()) > 1:
         return []
 
-    from_nodes = (
-        layer.layer_type == 'PROCEDURAL'
-        and procedural.edits_in_graph(layer.procedural.kind)
-    )
+    painted = layer.layer_type == 'PAINT'
+    # An adjustment has chips and nothing under them: it has no value of its
+    # own, it changes the channels it is switched on for.
+    adjusting = layer.layer_type == 'ADJUSTMENT'
+    pattern = layer.layer_type == 'PROCEDURAL'
+    from_nodes = pattern and procedural.edits_in_graph(layer.procedural.kind)
 
-    rows = []
-    for identifier in document.active_channels():
-        owner = f"ch:{identifier}"
-        label = doc.channel_label(identifier)
-        enabled = layer.writes(identifier)
+    # A paint layer writes Base Color and nothing else: the other chips
+    # would be switches that do nothing.
+    offered = ('BASE_COLOR',) if painted else doc.CHANNEL_IDS
 
-        painted = identifier == 'BASE_COLOR' and layer.layer_type == 'PAINT'
-        if painted or from_nodes:
-            note = "painted" if painted else "from nodes"
-            rows.append(_row(owner, "enabled", text=f"{label}  ({note})",
-                             context=context))
+    chips = [{
+        "owner": f"ch:{identifier}",
+        "key": "enabled",
+        "value": layer.writes(identifier),
+        "label": _CHIP_LABELS.get(identifier, doc.channel_label(identifier)),
+        "desc": f"Write to {doc.channel_label(identifier)}",
+    } for identifier in offered]
+    rows = [{"kind": 'chips', "chips": chips,
+             "desc": "The channels this layer writes to"}]
+
+    for identifier in offered:
+        if adjusting or not layer.writes(identifier):
             continue
+        label = doc.channel_label(identifier)
 
-        key = "color" if doc.channel_kind(identifier) == 'COLOR' else "value"
-        rows.append(_row(
-            owner, key, label=label, active=enabled, slider=True,
-            context=context,
-            suffix=_compact([
-                _toggle(owner, "enabled", 'EYE', context, alt_icon='EYE_OFF'),
-            ]),
-        ))
+        if identifier == 'BASE_COLOR':
+            if painted:
+                rows.append({"kind": 'label', "label": f"{label}  (painted)",
+                             "active": False})
+                continue
+            if from_nodes:
+                rows.append({"kind": 'label', "label": f"{label}  (from nodes)",
+                             "active": False})
+                continue
+            if pattern:
+                continue
+
+        rows.extend(_channel_value_rows(layer, identifier, context))
+
+    if layer.has_channel_images():
+        rows.append(_projection_panel(layer, context))
 
     rows = _compact(rows)
-    if not rows:
-        return []
-
     return [{
         "kind": 'panel',
-        "key": "channels",
-        "label": "Channels",
+        "key": "properties",
+        "label": "Properties",
         "open": True,
         "rows": rows,
     }]
+
+
+def _channel_value_rows(layer, identifier, context):
+    """The rows for one switched-on channel of a non-paint layer.
+
+    On a Fill a channel can hold an image: without
+    one, the value row carries an image icon at its end; with one, the slot
+    replaces Base Color's and Normal's value and sits under the slider
+    of the others, which becomes the image's multiplier. A Normal image's
+    DirectX switch is in the Parameters block, not here.
+    """
+    from . import document as doc
+
+    owner = f"ch:{identifier}"
+    label = doc.channel_label(identifier)
+    record = layer.channel(identifier)
+    key = doc.channel_value_attr(identifier)
+    colour = doc.channel_is_color(identifier)
+    fill = layer.layer_type == 'FILL'
+
+    if not fill or record.image is None:
+        row = _row(owner, key, label=label, slider=True, context=context)
+        if row is not None and fill:
+            row["suffix"] = list(row.get("suffix") or ()) + [{
+                "owner": owner, "key": "image", "value": False,
+                "icon": 'IMAGE',
+                "desc": f"Load an image into {label}",
+                "action": ('idblock_open', owner, "image"),
+            }]
+        return [row]
+
+    rows = []
+    if not colour:
+        rows.append(_row(owner, key, label=label, slider=True, context=context))
+    slot = _idblock_row(owner, "image", context, buttons=('open',))
+    if slot is not None:
+        slot["label"] = label if colour else "Image"
+    rows.append(slot)
+    return rows
+
+
+def _vector_row(owner, key, components, context):
+    """A vector property's chosen components as one row of fields."""
+    fields = []
+    for index in components:
+        field = _row(owner, key, index=index, context=context)
+        if field is not None:
+            field["prefix"] = "XYZW"[index]
+            fields.append(field)
+    if not fields:
+        return None
+    prop = _panel_owner(owner, key, context).bl_rna.properties[key]
+    return {
+        "kind": 'vector',
+        "owner": owner,
+        "key": key,
+        "label": prop.name,
+        "desc": prop.description or prop.name,
+        "active": True,
+        "fields": fields,
+    }
+
+
+def _projection_panel(layer, context):
+    """The Parameters block: how the layer's images are read. One block for
+    all of them, folded until opened.
+
+    Projection first -- UV shows the two axes a UV map has, Planar all three
+    and the axis it projects along -- then, when Normal holds an image, the
+    DirectX switch as a plain checkbox (the user's ask: in here, not a wide
+    button under the slot).
+    """
+    planar = layer.projection.mode == 'PLANAR'
+    rows = [_row('projection', "mode", kind='enum_row', context=context)]
+    if planar:
+        rows.append(_row('projection', "axis", kind='enum_row', context=context))
+    axes = (0, 1, 2) if planar else (0, 1)
+    turns = (0, 1, 2) if planar else (2,)
+    # One row per vector, its components side by side (the user's ask) --
+    # each field still carries its own key, `position[1]`.
+    for key, components in (("position", axes), ("rotation", turns),
+                            ("scale", axes)):
+        rows.append(_vector_row('projection', key, components, context))
+    scale = rows[-1]
+    if scale is not None:
+        # The uniform switch at the end of the Scale row, where Blender puts
+        # its own "lock these together" toggles.
+        scale["suffix"] = [{
+            "owner": 'projection', "key": "uniform_scale",
+            "value": layer.projection.uniform_scale, "icon": 'LINK',
+            "desc": "Uniform: scale X, Y and Z together",
+        }]
+    if layer.writes('NORMAL') and layer.ch_normal.image is not None:
+        rows.append(_separator())
+        rows.append(_row('ch:NORMAL', "flip_green", context=context))
+    return {
+        "kind": 'panel',
+        "key": "parameters",
+        "label": "Parameters",
+        "open": False,
+        "rows": _compact(rows),
+    }
 
 
 def _adjustment_rows(context):
@@ -912,7 +1052,7 @@ def _channel_label(identifier):
 def _layer_panel_rows(context):
     """Everything the section under the layer list shows, in order.
 
-    Channels first: what a layer *is* comes before how its pattern is shaped.
+    Properties first: what a layer *is* comes before how its pattern is shaped.
     """
     # An effect being selected takes the section over: it is what was just
     # clicked, and showing the layer's channels instead would be answering a
@@ -955,7 +1095,13 @@ def _effect_property_rows(context):
     rows = [{
         "kind": 'label',
         "label": f"{effect.label()}  --  on the {where}",
-    }, _separator()]
+    }]
+    # Which channels a content effect acts on: the same chips
+    # the layer has. A mask is one factor for every channel, so a mask
+    # effect has none.
+    if not document.active_on_mask:
+        rows.append(_effect_channel_chips(effect))
+    rows.append(_separator())
 
     if effect.effect_type == 'PAINT':
         # There is nothing to set. What a paint effect becomes is painted, and
@@ -995,6 +1141,22 @@ def _effect_property_rows(context):
     # second thing to keep in sync for no new ability. What is left is what
     # only this panel can say: the effect's own parameters.
     return rows
+
+
+def _effect_channel_chips(effect):
+    from . import document as doc
+
+    return {
+        "kind": 'chips',
+        "desc": "The channels this effect acts on",
+        "chips": [{
+            "owner": "effect",
+            "key": "on_" + identifier.lower(),
+            "value": effect.writes(identifier),
+            "label": _CHIP_LABELS.get(identifier, doc.channel_label(identifier)),
+            "desc": f"Apply to {doc.channel_label(identifier)}",
+        } for identifier in doc.CHANNEL_IDS],
+    }
 
 
 def _procedural_rows(context):
@@ -2664,8 +2826,26 @@ def _export_dialog_rows(context):
              context=context),
     ]
 
-    # No channel ticks: Base Color is the only channel, and it is what
-    # every export writes.
+    # Which channels to write: one row of chips rather than five checkboxes
+    #. The Normal format sits under them only while Normal is ticked.
+    from . import document as doc
+
+    props = scene.paintr2
+    rows.append(_separator())
+    rows.append({
+        "kind": 'chips',
+        "desc": "The channels written, one file each",
+        "chips": [{
+            "owner": 'scene',
+            "key": "export_" + identifier.lower(),
+            "value": bool(getattr(props, "export_" + identifier.lower())),
+            "label": _CHIP_LABELS.get(identifier, doc.channel_label(identifier)),
+            "desc": f"Write {doc.channel_label(identifier)}",
+        } for identifier in doc.CHANNEL_IDS],
+    })
+    if props.export_normal:
+        rows.append(_row('scene', "export_normal_format", label="Normal",
+                         kind='enum_row', context=context))
     return _compact(rows)
 
 
@@ -3285,6 +3465,10 @@ def _panel_owner(owner, key="", context=None):
         if layer is None:
             return None
         return layer.channel(owner[3:])
+    if owner == 'projection':
+        document = paint.active_document(context)
+        layer = document.active_layer if document is not None else None
+        return None if layer is None else layer.projection
     if owner == 'doc':
         return paint.active_document(context)
     if owner in ('effect', 'effect_filter', 'effect_pattern'):
@@ -4379,6 +4563,14 @@ def _set_panel_prop(owner, key, value):
     if holder is None:
         return
 
+    # A uniform scale: whichever field moved, all three follow it.
+    if owner == 'projection' and key == "scale" and index is not None \
+            and getattr(holder, "uniform_scale", False):
+        value = float(_fit(holder, key, value))
+        holder.scale = (value, value, value)
+        session.tag_redraw()
+        return
+
     try:
         if index is None:
             setattr(holder, key, _fit(holder, key, value))
@@ -4677,7 +4869,8 @@ def _set_panel_width(side, width):
         return
 
     key = {'LAYERS': "right_panel_width",
-           'BRUSH': "brush_panel_width"}.get(side, "left_panel_width")
+           'BRUSH': "brush_panel_width",
+           'PROPERTIES': "properties_height"}.get(side, "left_panel_width")
     if getattr(ui_state, key) != int(width):
         setattr(ui_state, key, int(width))
 
@@ -4875,18 +5068,65 @@ def _layer_at(index):
     return document.layers[index]
 
 
+def _view_channel():
+    """The channel the rows are showing, Base Color when there is no document."""
+    from . import paint
+
+    document = paint.active_document()
+    return document.view_channel if document is not None else 'BASE_COLOR'
+
+
 def _set_blend(index, identifier):
+    """A row's blend, in the channel the rows are showing."""
     layer = _layer_at(index)
-    if layer is not None and layer.blend_mode != identifier:
-        layer.blend_mode = identifier  # update hook recompiles
+    if layer is None:
+        return
+    channel = _view_channel()
+    holder = layer if channel == 'BASE_COLOR' else layer.channel(channel)
+    if holder.blend_mode != identifier:
+        holder.blend_mode = identifier  # update hook recompiles
         session.tag_redraw()
 
 
 def _set_opacity(index, value):
     layer = _layer_at(index)
-    if layer is not None:
-        layer.opacity = value
+    if layer is None:
+        return
+    channel = _view_channel()
+    holder = layer if channel == 'BASE_COLOR' else layer.channel(channel)
+    holder.opacity = value
+    session.tag_redraw()
+
+
+def _set_view_channel(identifier):
+    from . import paint
+
+    document = paint.active_document()
+    if document is not None and document.view_channel != identifier:
+        document.view_channel = identifier
         session.tag_redraw()
+
+
+def _channel_picker(context):
+    """(items, value, dimmed) for the channel picker in the Layers title.
+
+    Dimmed are the channels no layer writes to yet: still
+    there, still choosable, saying "nothing uses this".
+    """
+    from . import document as doc
+    from . import paint
+
+    document = paint.active_document(context)
+    if document is None:
+        return [], None, ()
+    used = {
+        channel for layer in document.layers
+        if layer.layer_type not in ('GROUP', 'ADJUSTMENT')
+        for channel in layer.channel_ids()
+    }
+    items = [(c, doc.channel_label(c)) for c in doc.CHANNEL_IDS]
+    dimmed = [c for c in doc.CHANNEL_IDS if c not in used]
+    return items, document.view_channel, dimmed
 
 
 def _rename_layer(index, name):
@@ -5089,6 +5329,12 @@ def _show_node_tree(tree):
 def _layer_panel_action(action, *_args):
     """Everything in the layer properties section that is not a value write."""
     from . import paint
+
+    # A channel image's slot: open a file, or empty it. The same datablock
+    # actions the brush texture rows use, so the same handler.
+    if action in ('idblock_open', 'idblock_unlink'):
+        _brush_panel_action(action, *_args)
+        return
 
     document = paint.active_document()
 
@@ -5672,8 +5918,10 @@ def _make_root():
     root = UIRoot(on_close=request_close)
     from .nodegen import _SCALAR_BLEND
 
+    from .document import NORMAL_BLEND_MODES
+
     root.set_blend_items(
-        [(item[0], item[1]) for item in BLEND_MODES],
+        [(item[0], item[1]) for item in BLEND_MODES + NORMAL_BLEND_MODES],
         # The compiler's own table decides this: a mode with a float
         # arithmetic behind it, plus MIX which always has one.
         scalar_only={'MIX', *_SCALAR_BLEND},
@@ -5715,6 +5963,7 @@ def _make_root():
     root.on_layer_reorder = _reorder_layer
     root.on_layer_rename = _rename_layer
     root.on_blend_change = _set_blend
+    root.on_channel_pick = _set_view_channel
     root.on_opacity_change = _set_opacity
     root.on_mask_add = _add_mask
     root.on_mask_remove = _remove_mask

@@ -102,6 +102,9 @@ class UIRoot(Container):
     CHIP_SIZE = theme.LAYER_CHIP
     OPACITY_WIDTH = theme.LAYER_OPACITY_WIDTH
     BLEND_WIDTH = 78
+    # The channel picker in the Layers title: wide enough for "Base Color"
+    # and its chevron, which is the longest channel name.
+    CHANNEL_PICKER_WIDTH = 104
     CONTROL_HEIGHT = theme.LAYER_CONTROL_HEIGHT
     # How little room the name may be left with before a right-hand control
     # is dropped instead. Blend goes first, opacity second: the blend mode is
@@ -126,13 +129,15 @@ class UIRoot(Container):
     # headings and one empty row each, so the panel still says what it is.
     TARGETS_MIN_ROWS = 2
 
-    # The properties section under the list: what the active layer's pattern
-    # is edited in. Zero-height when there is nothing to edit, so the list
-    # gets the whole panel back, and never more than this share of the panel
-    # when it is open -- the list is what the panel is for. The section does
-    # not scroll, so a spec taller than the share is clipped; every block in
-    # it is collapsible, which is the way out.
-    PROPERTIES_SHARE = 0.5
+    # The properties section under the list. Its height is the user's, set by
+    # dragging its top edge (`properties_height` in PR2_UIState) -- not fitted
+    # to its content, which moved the list every time the selection changed.
+    # Content taller than that scrolls. Zero when there is nothing to show, so
+    # the list gets the whole panel back. The range matches the RNA property;
+    # the list always keeps LIST_MIN_HEIGHT.
+    PROPERTIES_HEIGHT_RANGE = (60, 1200)
+    LIST_MIN_HEIGHT = 80
+    _properties_size = 220
 
     # Which icon a layer row's chip shows when there is no image to show. A
     # procedural is looked up by its kind first, because "generated" is not
@@ -333,6 +338,8 @@ class UIRoot(Container):
         # The per-layer ones take the row index first: they act on the row that
         # was clicked, which is not necessarily the active layer.
         self.on_blend_change = None
+        # (channel identifier) -- the channel picker in the Layers title.
+        self.on_channel_pick = None
         self.on_opacity_change = None
         self.on_mask_add = None
         self.on_mask_remove = None
@@ -986,6 +993,19 @@ class UIRoot(Container):
         # row that was clicked and driven as overlays. That is what lets a
         # 28-pixel row carry a nineteen-item menu and a text field.
 
+        # Which channel the rows' blend and opacity are showing, in the
+        # Layers title, right side. Only what the rows show changes -- the
+        # viewport keeps the whole material.
+        self.channel_picker = self.add(
+            Dropdown(on_change=self._on_channel_picked, name="channel_picker")
+        )
+        self.channel_picker.tooltip = (
+            "Which channel the layer rows show the blend mode and opacity of"
+        )
+        self.channel_picker.popup_width = 120
+        self.channel_picker.visible = False
+        self._channel_picker_wanted = False
+
         self.row_blend = Dropdown(
             on_change=self._on_row_blend_selected, name="row_blend"
         )
@@ -1045,6 +1065,7 @@ class UIRoot(Container):
         self._selection_has_group = False
         # Which row a context menu was opened over.
         self._context_row = -1
+        self._context_part = 'NONE'
         # Which half of the effect menu is being offered.
         self._effect_on_mask = False
         # The panel edge being dragged, and the one merely hovered.
@@ -1270,13 +1291,7 @@ class UIRoot(Container):
             self.properties.set_rows(rows)
             self.needs_redraw = True
 
-        wanted = 0
-        if rows:
-            scale = max(0.01, self._ui_scale)
-            needed = int(math.ceil(self.properties.content_height() / scale))
-            share = int(self.layers.height / scale * self.PROPERTIES_SHARE)
-            wanted = max(0, min(needed, share))
-
+        wanted = self._fitted_properties_height() if rows else 0
         if wanted != self._properties_height:
             self._properties_height = wanted
             self.layers.child_heights[self._properties_index] = wanted
@@ -1284,6 +1299,20 @@ class UIRoot(Container):
             # and it only does that when the region itself changed.
             self.layers.on_resize()
             self.needs_redraw = True
+
+    def set_properties_height(self, height):
+        """The height the user gave the section, unscaled. Pushed in from the
+        .blend each redraw, the way the panel widths are."""
+        low, high = self.PROPERTIES_HEIGHT_RANGE
+        self._properties_size = int(max(low, min(high, height)))
+
+    def _fitted_properties_height(self):
+        """The user's height, shortened only when the panel cannot hold it
+        and still show some of the list."""
+        scale = max(0.01, self._ui_scale)
+        room = self.layers.height / scale - self.LIST_MIN_HEIGHT - 120
+        return int(max(self.PROPERTIES_HEIGHT_RANGE[0],
+                       min(self._properties_size, room)))
 
     def _on_mask_choice(self, identifier):
         if identifier in ('WHITE', 'BLACK'):
@@ -1349,50 +1378,73 @@ class UIRoot(Container):
         # from its top edge rather than off the bottom of the window.
         self._open_delete_menu(button.x, button.y + button.height, above=True)
 
-    def _on_layer_row_context(self, index, _local_x, _local_y):
-        """Right click on a row: the commands that do not fit on it.
+    def _on_layer_row_context(self, index, local_x, _local_y):
+        """Right click on a row: the commands for *what was clicked*.
 
-        The row is made active first. A menu that acts on a layer other than
-        the one it was opened over is the kind of thing that only shows up
-        after it has already deleted the wrong one -- unless the row is part
-        of the current selection, in which case the selection is what the
-        commands are about and taking it apart would be wrong.
+        A row is three things, and each gets its own menu: the Color chip,
+        the Mask chip, and the layer itself (everything else on the row). A
+        mask command in a menu opened over the colour is a command aimed at
+        something other than what the pointer is on.
+
+        The click selects what it lands on, exactly as a left click would --
+        the row, and the half when it is on a chip -- so a filter added from
+        the menu goes where the menu was opened. Unless the row is part of a
+        multi-selection: then the selection is what the commands are about,
+        and they are the layer's.
         """
         row = self._row(index)
         if row is None:
             return False
 
-        if not row.get("selected"):
-            self._on_layer_activate(index)
+        part = 'NONE'
+        if not self._multi_select and row.get("type") != 'EFFECT':
+            part = self._row_part(index, local_x)
+
+        if not row.get("selected") or part != 'NONE':
+            self._on_layer_activate(index, local_x=local_x)
 
         self._context_row = index
+        self._context_part = part
         x, y, _width, height = self._row_rect(index)
         return self._open_row_menu(
             self._last_mouse[0], min(y + height, self.height)
         )
 
-    def _open_row_menu(self, x, y):
-        row = self._row(self._context_row)
-        if row is None:
-            return False
-
+    def _row_menu_items(self, row, part):
+        """What the menu over `part` of `row` offers, in order."""
         multi = self._multi_select
         items = []
-        if not multi:
-            items.append(('RENAME', "Rename"))
-        items.append(('SOLO', "Solo Layer"))
-        if row.get("has_mask") and not multi:
+
+        if part == 'COLOR':
+            if row.get("color") is not None:
+                items.append(('EDIT_COLOR', "Edit Color..."))
+            items.append(('EFFECT', "Add Filter"))
+            items.append(('PAINT_EFFECT', "Add Paint"))
+            return items
+
+        if part == 'MASK':
             items.append(('SOLO_MASK', "Solo Mask"))
             items.append(('MASK_TOGGLE',
                           "Enable Mask" if not row.get("mask_on")
                           else "Disable Mask"))
-        # Only a painted mask is a file. A generated one is a pattern in the
-        # shader with no pixels to write out, so there is nothing to offer.
-        if row.get("paint_mask") and not multi:
-            items.append(('EXPORT_MASK', "Export Mask..."))
-        if not multi and self._active_part != 'NONE':
-            items.append(('EFFECT', f"Add Filter to the "
-                                    f"{self._active_part.title()}"))
+            items.append(('MASK_INVERT', "Invert Mask"))
+            items.append(('EFFECT', "Add Filter"))
+            items.append(('PAINT_EFFECT', "Add Paint"))
+            # Only a painted mask is a file. A generated one is a pattern in
+            # the shader with no pixels to write out.
+            if row.get("paint_mask"):
+                items.append(('EXPORT_MASK', "Export Mask..."))
+                items.append(('MASK_DELETE', "Delete Mask"))
+            return items
+
+        if not multi:
+            items.append(('RENAME', "Rename"))
+        items.append(('SOLO', "Solo Layer"))
+        # A layer without a mask has no chip to right-click for one, so the
+        # way to make one is here.
+        if not multi and not row.get("has_mask") and row.get("type") != 'GROUP':
+            items.append(('MASK_WHITE', "Add White Mask"))
+            items.append(('MASK_BLACK', "Add Black Mask"))
         items.append(('TAG', "Color Tag..."))
         if multi:
             items.append(('GROUP', f"Group {self._selected_count} Layers"))
@@ -1406,10 +1458,23 @@ class UIRoot(Container):
             items.append(('PASTE', f"Paste {self._clipboard_count} Layer(s)"))
 
         items.append(('DELETE', "Delete..."))
+        return items
+
+    def _open_row_menu(self, x, y):
+        row = self._row(self._context_row)
+        if row is None:
+            return False
+
+        part = getattr(self, "_context_part", 'NONE')
+        title = row.get("name", "")
+        if part == 'COLOR':
+            title = f"{title}  -  Color"
+        elif part == 'MASK':
+            title = f"{title}  -  Mask"
 
         return self.menu.open_at(
-            x, y, items, self._on_row_menu_choice,
-            title=row.get("name", ""),
+            x, y, self._row_menu_items(row, part), self._on_row_menu_choice,
+            title=title,
         )
 
     def _on_row_menu_choice(self, identifier):
@@ -1423,8 +1488,16 @@ class UIRoot(Container):
             self._emit(self.on_layer_solo, 'MASK', self._layer_index(index))
         elif identifier == 'MASK_TOGGLE':
             self._emit(self.on_mask_toggle, self._layer_index(index))
+        elif identifier == 'MASK_INVERT':
+            self._emit(self.on_mask_invert)
+        elif identifier == 'MASK_DELETE':
+            self._emit(self.on_mask_remove)
+        elif identifier in ('MASK_WHITE', 'MASK_BLACK'):
+            self._emit(self.on_mask_add, identifier[5:])
         elif identifier == 'EXPORT_MASK':
             self._emit(self.on_mask_export, self._layer_index(index))
+        elif identifier == 'EDIT_COLOR':
+            self._open_fill_picker(index)
         elif identifier == 'GROUP':
             self._emit(self.on_layer_group_selected)
         elif identifier == 'COPY':
@@ -1433,6 +1506,8 @@ class UIRoot(Container):
             self._emit(self.on_layer_paste)
         elif identifier == 'EFFECT':
             self._emit(self.on_effect_add, 'FILTER', "")
+        elif identifier == 'PAINT_EFFECT':
+            self._emit(self.on_effect_add, 'PAINT', "")
         elif identifier == 'TAG':
             # A second menu rather than a submenu: one level of nesting is
             # all this needs, and a submenu that opens sideways has edges to
@@ -1972,8 +2047,37 @@ class UIRoot(Container):
     def blend_label(self, identifier):
         return self.row_blend.label_for(identifier)
 
+    def sync_channels(self, items, value, dimmed=()):
+        """Give the channel picker its channels and the one being shown.
+
+        Empty `items` hides it: no document, nothing to pick between.
+        """
+        items = list(items or ())
+        wanted = bool(items)
+        changed = (
+            items != self.channel_picker.items
+            or value != self.channel_picker.value
+            or set(dimmed) != self.channel_picker.dimmed
+            or wanted != self._channel_picker_wanted
+        )
+        self.channel_picker.items = items
+        self.channel_picker.value = value
+        self.channel_picker.dimmed = set(dimmed)
+        self._channel_picker_wanted = wanted
+        self.channel_picker.visible = wanted and self.layers.visible
+        if changed:
+            self.needs_redraw = True
+
+    def _on_channel_picked(self, identifier):
+        self._emit(self.on_channel_pick, identifier)
+
     def _blend_items_for(self, row):
         """The blend modes this row is allowed to offer."""
+        allowed = row.get("blend_modes")
+        if allowed is not None:
+            # The row's channel decides, in the order the compiler lists them.
+            labels = dict(self._blend_items)
+            return [(mode, labels.get(mode, mode)) for mode in allowed]
         if not row.get("scalar_only"):
             return self._blend_items
         return [
@@ -2395,9 +2499,13 @@ class UIRoot(Container):
             draw.rounded_rect(x + inset, y, width - inset * 2, height, radius,
                               theme.DRAG_VEIL[:3] + (0.35,))
         elif solo:
+            # Inset by half the line: a polyline is centred on its path, and
+            # the half outside the row would be clipped by the list.
+            line = max(1, self.px(theme.SOLO_FRAME_WIDTH))
+            half = line * 0.5
             draw.rounded_rect_outline(
-                x + inset, y, width - inset * 2, height, radius,
-                theme.ACCENT, max(1, self.px(1)),
+                x + inset + half, y + half, width - inset * 2 - line,
+                height - line, radius, theme.SOLO_FRAME, line,
             )
 
         # The colour tag: a stripe down the left edge, the way the outliner
@@ -2501,6 +2609,24 @@ class UIRoot(Container):
             name_width,
         )
 
+        self._draw_channel_chips(zones, item)
+
+    def _draw_channel_chips(self, zones, item):
+        """Blend and opacity -- or, for a layer that does not write to the
+        channel being shown, a faded dash in their place. The row is still
+        there and still selectable; there is simply nothing of it in this
+        channel to set."""
+        if item.get("channel_absent"):
+            for key in ('BLEND', 'OPACITY'):
+                rect = zones.get(key)
+                if rect is None:
+                    continue
+                x, y, width, height = rect
+                draw.text_centered(
+                    x + width * 0.5, y + height * 0.5, "\u2014",
+                    self.px(theme.FONT_SIZE_SMALL), theme.WIDGET_TEXT_DIM,
+                )
+            return
         if 'OPACITY' in zones:
             self._draw_opacity_chip(zones['OPACITY'], item.get("opacity", 1.0))
         if 'BLEND' in zones:
@@ -2826,6 +2952,10 @@ class UIRoot(Container):
         # half of a layer is a selection, so it belongs on the same path as
         # selecting the layer -- and a click this path takes is never half of
         # a double click, which the colour chip needs.
+
+        # A dash is not a control: a click on it is a click on the row.
+        if row.get("channel_absent") and zone in ('BLEND', 'OPACITY'):
+            return False
 
         if zone == 'BLEND':
             self._open_blend_menu(index)
@@ -3638,6 +3768,8 @@ class UIRoot(Container):
         band_h = max(0, tool_y - band_y)
 
         layers_w = self.px(self._layers_width) if self.layers.visible else 0
+        if not self.layers.visible:
+            self.channel_picker.visible = False
         display_w = self.px(self._display_width) if self.display.visible else 0
         brush_w = self.px(self._brush_panel_width) if self.brush_panel.visible else 0
 
@@ -3679,8 +3811,26 @@ class UIRoot(Container):
             self.layers.set_rect(
                 column_x, band_y, layers_w, max(0, band_h - targets_h)
             )
+            self._place_channel_picker()
 
             self._fit_target_lists(targets_h)
+
+    def _place_channel_picker(self):
+        """Top right of the Layers panel, level with its title."""
+        picker = self.channel_picker
+        picker.visible = self._channel_picker_wanted and self.layers.visible
+        if not picker.visible:
+            return
+        pad = self.px(self.layers.padding)
+        title_h = self.px(theme.FONT_SIZE_TITLE + theme.PAD)
+        height = min(self.px(Dropdown.ROW_HEIGHT), title_h)
+        width = min(self.px(self.CHANNEL_PICKER_WIDTH),
+                    max(0, self.layers.width // 2))
+        top = self.layers.y + self.layers.height - pad
+        picker.set_rect(
+            self.layers.x + self.layers.width - pad - width,
+            top - height, width, height,
+        )
 
     def _fit_target_lists(self, panel_height):
         """Give each of the two lists the rows it has, and share what is left.
@@ -3835,6 +3985,13 @@ class UIRoot(Container):
         """
         grab = self.px(self.SPLITTER_GRAB)
 
+        # The Properties section's top edge: the one horizontal splitter.
+        props = self.properties
+        if self.layers.visible and props.height > 0 and \
+                props.x <= mouse_x < props.x + props.width and \
+                abs(mouse_y - (props.y + props.height)) <= grab:
+            return 'PROPERTIES'
+
         if self.layers.visible:
             top = self.targets if self.targets.visible else self.layers
             bottom = self.layers.y
@@ -3856,8 +4013,24 @@ class UIRoot(Container):
 
         return None
 
-    def _drag_splitter(self, mouse_x):
+    def _drag_splitter(self, mouse_x, mouse_y=0):
         """Resize the panel being dragged. True when the width changed."""
+        if self._splitter == 'PROPERTIES':
+            low, high = self.PROPERTIES_HEIGHT_RANGE
+            wanted = (mouse_y - self.properties.y) / max(1e-6, self._ui_scale)
+            wanted = int(max(low, min(high, round(wanted))))
+            if wanted == self._properties_size:
+                return False
+            self._properties_size = wanted
+            fitted = self._fitted_properties_height()
+            if fitted != self._properties_height:
+                self._properties_height = fitted
+                self.layers.child_heights[self._properties_index] = fitted
+                self.layers.on_resize()
+            self.needs_redraw = True
+            self._emit(self.on_panel_width, 'PROPERTIES', wanted)
+            return True
+
         if self._splitter == 'LAYERS':
             low, high = self.LAYERS_WIDTH_RANGE
             wanted = (self.width - mouse_x) / max(1e-6, self._ui_scale)
@@ -3909,7 +4082,7 @@ class UIRoot(Container):
         # line and the hand is not going to stay on it.
         if self._splitter is not None:
             if event.is_move:
-                self._drag_splitter(event.mouse_x)
+                self._drag_splitter(event.mouse_x, event.mouse_y)
                 return True
             if event.is_left_release:
                 self._splitter = None
@@ -4168,7 +4341,10 @@ class UIRoot(Container):
         modal operator reads this and hands it to Blender. The names are
         Blender's own `cursor_modal_set` identifiers.
         """
-        if self._splitter is not None or self._over_splitter is not None:
+        side = self._splitter or self._over_splitter
+        if side == 'PROPERTIES':
+            return 'MOVE_Y'
+        if side is not None:
             return 'MOVE_X'
         if self.layer_list.is_dragging():
             return 'HAND_CLOSED'
@@ -4227,6 +4403,15 @@ class UIRoot(Container):
         """
         side = self._splitter or self._over_splitter
         if side is None:
+            return
+
+        colour = (theme.ACCENT if self._splitter else
+                  theme.ACCENT[:3] + (theme.ACCENT[3] * 0.5,))
+        if side == 'PROPERTIES':
+            props = self.properties
+            thickness = max(1, self.px(2))
+            draw.rect(props.x, props.y + props.height - thickness // 2,
+                      props.width, thickness, colour)
             return
 
         panel = self.layers if side == 'LAYERS' else self.display

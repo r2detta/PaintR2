@@ -3,7 +3,7 @@ schema_version = "1.0.0"
 # NOTE: `id` must match the extension directory name exactly. If you rename the
 # folder, rename this too, otherwise Blender rejects the extension on refresh.
 id = "PaintR2"
-version = "0.11.0"
+version = "0.11.10"
 name = "PaintR2"
 tagline = "Layer-based texture painting with exportable output"
 maintainer = "r2detta"

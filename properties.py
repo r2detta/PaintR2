@@ -41,6 +41,17 @@ class PR2_UIState(PropertyGroup):
     )
     show_right_panel: BoolProperty(name="Show Layer Panel", default=True)
 
+    # The Properties section under the layer list. A height the user drags
+    # its top edge to, not one fitted to whatever the active layer happens to
+    # show: a section that grew and shrank with every click moved the list
+    # under the pointer. Longer content scrolls.
+    properties_height: IntProperty(
+        name="Properties Height",
+        default=220,
+        min=60,
+        max=1200,
+    )
+
     # The Objects / Materials panel above the stack. Its own switch rather
     # than sharing the column's: with one model and one material there is
     # nothing in it to choose between, and the room is better spent on layers.
@@ -554,14 +565,48 @@ class PR2_SceneProps(PropertyGroup):
         default=False,
     )
 
-    def export_channels(self, document):
-        """The channels to write for `document`, in CHANNELS order.
+    # One tick per channel: which files an export writes is the
+    # user's choice, not something read off which channels are used. Scene
+    # properties, so the choice is still there next time; all on at first.
+    export_base_color: BoolProperty(
+        name="Base Color", default=True,
+        description="Write a Base Color texture",
+    )
+    export_roughness: BoolProperty(
+        name="Roughness", default=True,
+        description="Write a Roughness texture",
+    )
+    export_metallic: BoolProperty(
+        name="Metallic", default=True,
+        description="Write a Metallic texture",
+    )
+    export_normal: BoolProperty(
+        name="Normal", default=True,
+        description="Write a Normal texture, with the height baked into it",
+    )
+    export_height: BoolProperty(
+        name="Height", default=True,
+        description="Write a Height texture: 0.5 is flat, below is a dent, "
+        "above a bump",
+    )
 
-        Every channel the material carries. There used to be a tick per
-        channel here; with Base Color the only one a tick could only
-        mean "export nothing".
-        """
-        return list(document.active_channels())
+    # Only the green channel differs.
+    export_normal_format: EnumProperty(
+        name="Normal Format",
+        items=(
+            ('OPENGL', "OpenGL", "Green up (Y+), the convention Blender uses"),
+            ('DIRECTX', "DirectX", "Green down (Y-)"),
+        ),
+        default='OPENGL',
+    )
+
+    def export_channels(self, document):
+        """The channels to write for `document`, in CHANNELS order: the ticked
+        ones, whether or not a layer uses them."""
+        return [
+            c for c in document.active_channels()
+            if getattr(self, "export_" + c.lower(), False)
+        ]
 
     # --- mesh maps -----------------------------------------------------------
     # Their own resolution: a curvature or AO map does not need the size a

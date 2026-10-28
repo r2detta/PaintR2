@@ -350,10 +350,12 @@ def applies_to(kind, channel, is_color=None):
     from . import document as doc
 
     if is_color is None:
-        is_color = doc.channel_kind(channel) == 'COLOR'
+        is_color = doc.channel_is_color(channel)
 
+    # A normal is stored as a colour and means a direction: shifting its hue
+    # turns the surface somewhere nobody asked for.
     if kind in COLOR_ONLY:
-        return is_color
+        return is_color and doc.channel_kind(channel) != 'NORMAL'
     return True
 
 
@@ -368,7 +370,7 @@ def build(group, adj, channel, below, x, y, is_color=None):
     from . import document as doc
 
     if is_color is None:
-        is_color = doc.channel_kind(channel) == 'COLOR'
+        is_color = doc.channel_is_color(channel)
 
     if not applies_to(adj.kind, channel, is_color):
         return None

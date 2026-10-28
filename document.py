@@ -75,27 +75,69 @@ BLEND_MODES = (
     ('VALUE', "Value", "Takes brightness from the layer"),
 )
 
-# The channels a document can carry, in the order everything uses them: the
-# panel, the compiler, the export. Base Color only, for now: Roughness,
-# Metallic, Normal and Height were taken out until there is a consistent way
-# to do them. The table is kept so that putting a channel back is a row here
-# plus its wiring.
+# Blend modes only the Normal channel has. A tangent-space normal is a
+# direction stored as a colour, and blending two of them as colours tilts the
+# surface somewhere nobody asked for -- these two add the top layer's detail
+# *onto* the surface below instead (measured).
+# Normal's plain "Normal" (MIX) is the third option: a copy, which is how a
+# masked layer flattens what is under it.
+NORMAL_BLEND_MODES = (
+    ('DETAIL', "Detail", "Reoriented normal mapping: the layer's detail "
+     "follows the surface below it"),
+    ('COMBINE', "Combine", "Whiteout blending: both normals' detail kept, "
+     "cheaper than Detail"),
+)
+
+# Every mode a channel record can hold. One enum for all five channels because
+# an RNA enum cannot change its items per instance; which of them a channel
+# actually offers is `nodegen.blend_modes_for`.
+CHANNEL_BLEND_MODES = BLEND_MODES + NORMAL_BLEND_MODES
+
+# The channels a document carries, in the order everything uses them: the
+# panel, the compiler, the export. A material carries all five, always -- a
+# channel no layer writes to simply reads its default.
 #
 # `kind` decides which field of PR2_LayerChannel is read and which socket the
-# group output gets. `default` is what a channel reads where no layer
-# contributes -- the compiler's backdrop.
+# group output gets:
 #
-# `colorspace` and `float_buffer` are the measured export rules: a PNG's
-# bit depth comes from the image buffer, not from any save setting, and a
-# Non-Color target is the difference between writing 0.31 and writing 0.60.
+#     COLOR   `color`, a colour socket
+#     FLOAT   `value`, 0..1
+#     SIGNED  `signed`, -1..1 with 0 flat -- Height (the flat point is 0 in
+#             the tree and only an export encodes it as 0.5)
+#     NORMAL  `normal_color`, a tangent-space normal as a colour; starts flat
+#             (0.5, 0.5, 1), and with Normal (copy) blend a flat one flattens
+#             what is under it
+#
+# `default` is two things at once and they have to agree: what a channel
+# reads where no layer contributes (the compiler's backdrop), and the value a
+# layer's record starts with. Roughness 0.5 and Metallic 0 are also
+# Principled's own defaults, so a channel nobody touched looks like no channel.
+#
+# `colorspace` and `float_buffer` are the measured export rules: a PNG's bit
+# depth comes from the image buffer, not
+# from any save setting, and a Non-Color target is the difference between
+# writing 0.31 and writing 0.60. Height needs the float buffer for a second
+# reason: a byte buffer clips the negative half (measured).
+#
+# `blend` is the mode a layer's record starts with. Height adds:
+# a full-cover layer at 0 must change nothing, and under MIX it would flatten
+# every bump beneath it. Normal starts on Detail for the same reason.
 CHANNELS = (
-    ('BASE_COLOR', "Base Color", 'COLOR', (0.8, 0.8, 0.8, 1.0), 'sRGB', False),
+    # id,          label,        kind,     default,              colorspace,  float, blend
+    ('BASE_COLOR', "Base Color", 'COLOR',  (0.8, 0.8, 0.8, 1.0), 'sRGB',      False, 'MIX'),
+    ('ROUGHNESS',  "Roughness",  'FLOAT',  0.5,                  'Non-Color', False, 'MIX'),
+    ('METALLIC',   "Metallic",   'FLOAT',  0.0,                  'Non-Color', False, 'MIX'),
+    ('NORMAL',     "Normal",     'NORMAL', (0.5, 0.5, 1.0, 1.0), 'Non-Color', True,  'DETAIL'),
+    ('HEIGHT',     "Height",     'SIGNED', 0.0,                  'Non-Color', True,  'ADD'),
 )
 
 CHANNEL_IDS = tuple(entry[0] for entry in CHANNELS)
 
 # Field order matches CHANNELS, so `_channel_entry` can index either way.
 _CHANNEL_BY_ID = {entry[0]: entry for entry in CHANNELS}
+
+# The two kinds whose group socket is a colour.
+_COLOR_KINDS = frozenset({'COLOR', 'NORMAL'})
 
 
 def channel_entry(identifier):
@@ -113,6 +155,11 @@ def channel_kind(identifier):
     return entry[2] if entry else 'FLOAT'
 
 
+def channel_is_color(identifier):
+    """True when the channel travels as a colour: Base Color and Normal."""
+    return channel_kind(identifier) in _COLOR_KINDS
+
+
 def channel_default(identifier):
     entry = channel_entry(identifier)
     return entry[3] if entry else 0.0
@@ -127,11 +174,26 @@ def channel_float(identifier):
     """True for a channel whose 8 bits are visibly not enough.
 
     Measured: a PNG's bit depth comes from the image buffer alone, so this is
-    the whole of the 16-bit decision. No channel needs it today; Normal and
-    Height did.
+    the whole of the 16-bit decision. Normal and Height need it.
     """
     entry = channel_entry(identifier)
     return bool(entry[5]) if entry else False
+
+
+def channel_blend_default(identifier):
+    """The blend mode a layer's record for this channel starts with."""
+    entry = channel_entry(identifier)
+    return entry[6] if entry else 'MIX'
+
+
+def channel_value_attr(identifier):
+    """Which field of PR2_LayerChannel holds this channel's flat value."""
+    return {
+        'COLOR': "color",
+        'FLOAT': "value",
+        'SIGNED': "signed",
+        'NORMAL': "normal_color",
+    }.get(channel_kind(identifier))
 
 
 def channel_suffix(identifier):
@@ -143,10 +205,6 @@ def channel_suffix(identifier):
 # renaming the scheme is one edit.
 def channel_attr(identifier):
     return "ch_" + identifier.lower()
-
-
-def channel_use_attr(identifier):
-    return "use_" + identifier.lower()
 
 
 LAYER_TYPES = (
@@ -210,13 +268,60 @@ def _flat_changed(self, context):
 
     index = _layer_index(self)
     channel = _channel_of(self)
-    kind = channel_kind(channel) if channel else ""
-    value = self.color if kind == 'COLOR' else self.value
+    attribute = channel_value_attr(channel) if channel else None
+    if attribute is None:
+        nodegen.request_compile(owner)
+        return
+    value = getattr(self, attribute)
 
     if index < 0 or not channel or not nodegen.write_flat(
         owner, index, channel, value
     ):
         nodegen.request_compile(owner)
+
+
+def _channel_image_changed(self, context):
+    """An image went into (or out of) a channel slot: give it the channel's
+    colour space, then rebuild -- an image is a different shape of tree.
+
+    The colour space is the channel's, never the user's to pick: a
+    roughness map read as sRGB is a roughness that is quietly wrong.
+    """
+    channel = _channel_of(self)
+    if self.image is not None and channel:
+        wanted = channel_colorspace(channel)
+        try:
+            if self.image.colorspace_settings.name != wanted:
+                self.image.colorspace_settings.name = wanted
+        except (AttributeError, TypeError, ValueError):
+            pass
+    _recompile(self, context)
+
+
+def _projection_changed(self, context):
+    """Position, rotation and scale are numbers on one Mapping node: written
+    there, the way an opacity is. Mode and axis change the tree's shape and
+    rebuild."""
+    from . import nodegen
+
+    owner = self.id_data
+    if not isinstance(owner, bpy.types.Material):
+        return
+    index = _layer_index(self)
+    if index < 0 or not nodegen.write_mapping(owner, index, self):
+        nodegen.request_compile(owner)
+
+
+def _uniform_changed(self, context):
+    """Switching uniform scale on makes the scale uniform at once: Y and Z
+    take X's value. Off changes nothing -- the values stay where they are."""
+    if self.uniform_scale:
+        value = float(self.scale[0])
+        if tuple(self.scale) != (value, value, value):
+            # One write, so the Mapping node is written once.
+            self.scale = (value, value, value)
+            return
+    _projection_changed(self, context)
 
 
 def _opacity_changed(self, context):
@@ -239,7 +344,29 @@ def _opacity_changed(self, context):
         return
 
     index = _layer_index(self)
-    if index < 0 or not nodegen.write_opacity(owner, index, self.opacity):
+    if index < 0 or not nodegen.write_opacity(
+        owner, index, self.opacity, 'BASE_COLOR'
+    ):
+        nodegen.request_compile(owner)
+
+
+def _channel_opacity_changed(self, context):
+    """A channel record's opacity: the same cheap write, for its channel.
+
+    Base Color's opacity is `layer.opacity` and never comes through here --
+    see `PR2_Layer.channel_opacity`.
+    """
+    from . import nodegen
+
+    owner = self.id_data
+    if not isinstance(owner, bpy.types.Material):
+        return
+
+    index = _layer_index(self)
+    channel = _channel_of(self)
+    if index < 0 or not channel or not nodegen.write_opacity(
+        owner, index, self.opacity, channel
+    ):
         nodegen.request_compile(owner)
 
 
@@ -284,19 +411,29 @@ def _rewire(self, context):
 class PR2_LayerChannel(PropertyGroup):
     """What one layer contributes to one channel.
 
-    One class for all five channels: `color` is read for a COLOR channel and
-    `value` for a FLOAT one, and CHANNELS says which. Five classes would be
-    the same code five times.
+    One class for all five channels, and CHANNELS says which field a channel
+    reads: `color` for Base Color, `value` for Roughness and Metallic,
+    `signed` for Height, `normal_color` for Normal. Five classes would be the
+    same code five times.
 
     `enabled` off means the layer contributes *nothing* to that channel -- no
-    node is emitted for it, which is also what keeps a five-channel document
-    from compiling five times the tree it needs.
+    node is emitted for it. Switching it off keeps the value, so switching it
+    back on is getting the same layer back.
 
-    Base Color is the exception in one respect only: a PAINT layer takes its
-    Base Color from `layer.image`, not from here. Every other channel of every
-    layer type is a flat value, because the brush only ever paints Base Color
-    -- to make a channel vary across the surface you paint the *mask*,
-    which cuts all of the layer's channels at once.
+    `blend_mode` and `opacity` are per channel -- except Base
+    Color's, which stay on the layer itself as `layer.blend_mode` and
+    `layer.opacity`. Those two are what every file, every row and every test
+    already reads, and moving them would buy nothing but a migration; the
+    asymmetry lives in exactly two methods, `PR2_Layer.channel_blend` and
+    `channel_opacity`, and nothing else reads these fields for Base Color.
+
+    The values start wrong for most channels (`value` is 0.5 for Metallic
+    too, `blend_mode` MIX for Height): an RNA default cannot differ per
+    instance. `PR2_Layer.init_channels` writes the real ones from CHANNELS,
+    and `add_layer` calls it.
+
+    A PAINT layer takes its Base Color from `layer.image`, not from here, and
+    has no other channel at all: the brush paints Base Color only.
     """
 
     enabled: BoolProperty(
@@ -316,9 +453,6 @@ class PR2_LayerChannel(PropertyGroup):
         update=_flat_changed,
     )
 
-    # 0..1 for every scalar channel. Height's midpoint means flat rather than
-    # nothing (see CHANNELS), which is what keeps a dent expressible in a
-    # range that has no negative half.
     value: FloatProperty(
         name="Value",
         default=0.5,
@@ -326,6 +460,131 @@ class PR2_LayerChannel(PropertyGroup):
         max=1.0,
         subtype='FACTOR',
         update=_flat_changed,
+    )
+
+    # Height. Its own field rather than `value` with a wider range because an
+    # RNA range cannot change per instance, and Roughness must stop at 0..1.
+    signed: FloatProperty(
+        name="Value",
+        default=0.0,
+        min=-1.0,
+        max=1.0,
+        update=_flat_changed,
+    )
+
+    # Normal. A direction stored as a colour, so it is *data*: COLOR_GAMMA
+    # keeps the swatch showing the numbers themselves -- (0.5, 0.5, 1) is the
+    # familiar normal-map blue, not the pale lilac an sRGB encode would make
+    # of it. Starts flat; the user may tint it to tilt the surface.
+    normal_color: FloatVectorProperty(
+        name="Normal",
+        subtype='COLOR_GAMMA',
+        size=4,
+        min=0.0,
+        max=1.0,
+        default=(0.5, 0.5, 1.0, 1.0),
+        update=_flat_changed,
+    )
+
+    blend_mode: EnumProperty(
+        name="Blend",
+        items=CHANNEL_BLEND_MODES,
+        default='MIX',
+        update=_recompile,
+    )
+
+    opacity: FloatProperty(
+        name="Opacity",
+        default=1.0,
+        min=0.0,
+        max=1.0,
+        subtype='FACTOR',
+        update=_channel_opacity_changed,
+    )
+
+    # A picture in this channel, on a Fill layer. Empty, the
+    # channel is its flat value. Set, it replaces Base Color's and Normal's
+    # value outright and is multiplied by the slider on the others. Held
+    # by path, the way Blender holds any image it opened -- packing it into
+    # the .blend later is Blender's own business and changes nothing here.
+    image: PointerProperty(
+        name="Image",
+        description="A texture for this channel, projected by the layer's "
+        "Projection settings",
+        type=bpy.types.Image,
+        update=_channel_image_changed,
+    )
+
+    # Normal only. A DirectX normal map has its green pointing down; this
+    # reads it as OpenGL without touching the file.
+    flip_green: BoolProperty(
+        name="Convert DirectX to OpenGL",
+        description="The image is a DirectX normal map: flip its green "
+        "channel as it is read. The file is not changed",
+        default=False,
+        update=_recompile,
+    )
+
+
+PROJECTION_MODES = (
+    ('UV', "UV", "Along the model's UV map"),
+    ('PLANAR', "Planar", "Straight through the model along one of its own "
+     "axes, ignoring the UVs"),
+)
+
+
+class PR2_Projection(PropertyGroup):
+    """How a Fill layer's channel images land on the model.
+
+    One per layer, shared by every image the layer carries -- a colour map and
+    its normal map stay registered with each other. A layer that wants two
+    images placed differently is two layers.
+
+    The numbers are a texture transform, centred on the image: Position moves
+    the picture, Rotation turns it about its middle, Scale makes it bigger.
+    In UV only X and Y of Position and Scale, and Z of Rotation, mean
+    anything; the panel shows just those.
+    """
+
+    mode: EnumProperty(
+        name="Projection",
+        items=PROJECTION_MODES,
+        default='UV',
+        update=_recompile,
+    )
+
+    axis: EnumProperty(
+        name="Axis",
+        description="Which of the model's own axes Planar projects along",
+        items=(
+            ('X', "X", "Project along the model's X axis"),
+            ('Y', "Y", "Project along the model's Y axis"),
+            ('Z', "Z", "Project along the model's Z axis"),
+        ),
+        default='Z',
+        update=_recompile,
+    )
+
+    position: FloatVectorProperty(
+        name="Position", size=3, subtype='XYZ', default=(0.0, 0.0, 0.0),
+        update=_projection_changed,
+    )
+    rotation: FloatVectorProperty(
+        name="Rotation", size=3, subtype='EULER', default=(0.0, 0.0, 0.0),
+        update=_projection_changed,
+    )
+    scale: FloatVectorProperty(
+        name="Scale", size=3, subtype='XYZ', default=(1.0, 1.0, 1.0),
+        update=_projection_changed,
+    )
+
+    # On, changing any one scale field sets all three to it (the panel's
+    # write does that -- see `window._set_panel_prop`).
+    uniform_scale: BoolProperty(
+        name="Uniform",
+        description="Scale X, Y and Z together",
+        default=False,
+        update=_uniform_changed,
     )
 
 
@@ -362,6 +621,20 @@ class PR2_Layer(PropertyGroup):
     # colour is now `layer.channel('BASE_COLOR').color`.
 
     ch_base_color: PointerProperty(type=PR2_LayerChannel)
+    ch_roughness: PointerProperty(type=PR2_LayerChannel)
+    ch_metallic: PointerProperty(type=PR2_LayerChannel)
+    ch_normal: PointerProperty(type=PR2_LayerChannel)
+    ch_height: PointerProperty(type=PR2_LayerChannel)
+
+    # Where this layer's channel images land. Present on every
+    # layer, read only by a Fill that carries an image.
+    projection: PointerProperty(type=PR2_Projection)
+
+    def has_channel_images(self):
+        """True for a Fill layer with an image in any channel it writes."""
+        return self.layer_type == 'FILL' and any(
+            self.channel(c).image is not None for c in self.channel_ids()
+        )
 
     def channel(self, identifier):
         """This layer's record for one channel. The single access point."""
@@ -370,19 +643,41 @@ class PR2_Layer(PropertyGroup):
     def writes(self, identifier):
         """True when this layer contributes to `identifier`.
 
-        An ADJUSTMENT layer is the exception, and it writes to all of them.
-        It has no colour of its own to claim a channel with -- it transforms
-        whatever is underneath -- so the question "does this layer touch
-        Roughness" is answered by the *kind*, which `adjustment.applies_to`
-        already answers and which the compiler already honours by passing the
-        channel through untouched. A second answer in the form of five
-        checkboxes was a way to switch off a channel the adjustment was never
-        going to change anyway, and a way to leave Roughness switched off on a
-        Levels layer that was supposed to be flattening it.
+        An ADJUSTMENT layer answers the same way as every other layer: by its
+        channel records. With the channel picker an adjustment starts on the
+        channel being shown, and a
+        Levels meant for Roughness no longer touches the colour. A kind that
+        means nothing for a channel -- a hue shift on Height -- is still
+        skipped by `adjustment.applies_to`, whatever the box says.
         """
-        if self.layer_type == 'ADJUSTMENT':
-            return True
+        # The brush paints Base Color and nothing else: a
+        # paint layer's other channels are not switched off, they do not exist.
+        if self.layer_type == 'PAINT' and identifier != 'BASE_COLOR':
+            return False
         return self.channel(identifier).enabled
+
+    def channel_blend(self, identifier):
+        """This layer's blend mode in one channel.
+
+        Base Color's lives on the layer (see PR2_LayerChannel for why); every
+        other channel's on its own record.
+        """
+        if identifier == 'BASE_COLOR':
+            return self.blend_mode
+        return self.channel(identifier).blend_mode
+
+    def channel_opacity(self, identifier):
+        """This layer's opacity in one channel. Same split as the blend."""
+        if identifier == 'BASE_COLOR':
+            return self.opacity
+        return self.channel(identifier).opacity
+
+    def channel_value(self, identifier):
+        """The flat value this layer holds for a channel, or None (Normal)."""
+        attribute = channel_value_attr(identifier)
+        if attribute is None:
+            return None
+        return getattr(self.channel(identifier), attribute)
 
     def channel_ids(self):
         """Every channel this layer writes to, in CHANNELS order."""
@@ -397,10 +692,26 @@ class PR2_Layer(PropertyGroup):
         hand (a test, a future import) that writes to nothing compiles to
         nothing, silently, which is a sharp edge worth one named call.
         """
+        self.init_channels()
         if self.layer_type == 'GROUP':
             # A group contributes its children, never anything of its own.
             return
         self.channel('BASE_COLOR').enabled = True
+
+    def init_channels(self):
+        """Give every channel record the value and blend CHANNELS starts it on.
+
+        The RNA defaults are one set for five channels and wrong for most of
+        them -- Metallic would start at 0.5 and Height on MIX. Base Color's
+        colour is left alone: `add_layer` has already chosen it.
+        """
+        for identifier in CHANNEL_IDS:
+            record = self.channel(identifier)
+            attribute = channel_value_attr(identifier)
+            if attribute in ("value", "signed"):
+                setattr(record, attribute, float(channel_default(identifier)))
+            record.blend_mode = channel_blend_default(identifier)
+            record.opacity = 1.0
 
     # PROCEDURAL layers draw this pattern; ignored by the other types. It is
     # always present (a PointerProperty to a PropertyGroup cannot be None) --
@@ -593,17 +904,6 @@ class PR2_Document(PropertyGroup):
     """The stack belonging to one material."""
 
     layers: CollectionProperty(type=PR2_Layer)
-
-    # --- channels ------------------------------------------------------------
-    # Which channels this material has at all. With Base Color the only one
-    # this is always on; it stays a property because `uses()` is the question
-    # the compiler and the export ask, and a second channel will need it
-    # answered per material again.
-
-    use_base_color: BoolProperty(
-        name="Base Color", default=True, update=_rewire,
-        description="The painted colour of the surface",
-    )
 
     # --- how the stack is shown ----------------------------------------------
     # Per material, not per scene: the mode rewires *this* material's node
@@ -798,8 +1098,13 @@ class PR2_Document(PropertyGroup):
         return index < solo < self.subtree_end(index)
 
     def uses(self, identifier):
-        """True when this material carries `identifier` at all."""
-        return getattr(self, channel_use_attr(identifier))
+        """True when this material carries `identifier` at all.
+
+        Every material carries all five. The question is kept
+        because the compiler, the bake and the export ask it, and an unknown
+        identifier must still get a "no".
+        """
+        return identifier in CHANNEL_IDS
 
     def active_channels(self):
         """Every channel this document carries, in CHANNELS order."""
@@ -808,6 +1113,17 @@ class PR2_Document(PropertyGroup):
     # A UI cursor: it does not affect the compiled result, so no recompile --
     # but it does decide which image the brush paints into.
     #
+    # Which channel the layer rows show the blend and opacity of, and which
+    # channel a new effect goes to. A UI cursor like the one
+    # below it: nothing compiles off it and the viewport ignores it.
+    view_channel: EnumProperty(
+        name="Channel",
+        description="Which channel the layer rows show the blend mode and "
+        "opacity of",
+        items=[(entry[0], entry[1], "") for entry in CHANNELS],
+        default='BASE_COLOR',
+    )
+
     # -1 is a real state, not an error: nothing is selected. Clicking the empty
     # space under the rows puts the panel there, and it is what "add this to a
     # new layer rather than to the layer I happen to be on" needs to mean.
@@ -1101,6 +1417,12 @@ class PR2_Document(PropertyGroup):
         layer.layer_type = layer_type
 
         layer.enable_default_channels()
+        if layer_type == 'ADJUSTMENT':
+            # An adjustment changes the channel being looked at when it was
+            # added -- Base Color only if that is the one.
+            for identifier in CHANNEL_IDS:
+                layer.channel(identifier).enabled = (
+                    identifier == self.view_channel)
 
         if above_active and len(self.layers) > 1:
             target = min(max(self.active_index, 0), len(self.layers) - 1)
@@ -1144,6 +1466,7 @@ class PR2_Document(PropertyGroup):
 
 CLASSES = (
     PR2_LayerChannel,
+    PR2_Projection,
     PR2_Layer,
     PR2_Document,
 )

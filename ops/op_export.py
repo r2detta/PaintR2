@@ -159,6 +159,8 @@ class PAINTR2_OT_bake_texture(bpy.types.Operator):
             float_buffer=props.export_format == 'OPEN_EXR',
             on_channel=announce,
             settings=settings,
+            encode=True,
+            normal_format=props.export_normal_format,
         )
 
         for channel, result in results.items():

@@ -369,7 +369,10 @@ class PAINTR2_OT_effect_add(bpy.types.Operator):
         kinds = [item[0] for item in effects.kinds_for(self.effect_type)]
         kind = self.kind if self.kind in kinds else ""
 
-        effect = effects.add(layer, self.effect_type, kind, on_mask)
+        effect = effects.add(
+            layer, self.effect_type, kind, on_mask,
+            channel=None if on_mask else document.view_channel,
+        )
 
         if self.effect_type == 'PATTERN' and \
                 procedural.edits_in_graph(effect.pattern.kind):

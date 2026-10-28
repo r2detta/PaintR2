@@ -461,26 +461,20 @@ def _build_checker(group, proc, x, y):
 def build_channel(group, proc, channel, x, y):
     """A custom group's output for one channel, or None.
 
-    Only Custom has one: every other kind drives Base Color and leaves the
-    rest to the layer's flat values. A channel whose socket is missing
-    -- the group was built by an older version, or the user renamed it --
-    contributes nothing rather than raising.
-
     The group node itself is emitted once per channel. That is deliberate:
     Blender's shader compiler folds identical group instances, and the
     alternative is a cache keyed on (layer, group) threaded through every
     call site for a saving that does not show up in a frame time.
     """
+    # One output, spread over whichever channels the layer writes to
+    #. Base Color and Normal take it as the colour it is -- a
+    # normal map built inside the group *is* a colour. A scalar channel takes
+    # it as a factor; the layer's slider is multiplied on by the compiler.
     from . import document as doc
 
-    tree = proc.node_tree
-    if tree is None:
-        return None
-
-    node = _instance(group, proc, x, y)
-    if node is None:
-        return None
-    return node.outputs.get(doc.channel_label(channel))
+    if channel == 'BASE_COLOR' or doc.channel_kind(channel) == 'NORMAL':
+        return _build_custom(group, proc, x, y)
+    return build_factor(group, proc, x, y)
 
 
 def _instance(group, proc, x, y):
@@ -648,33 +642,23 @@ def ensure_custom_tree(proc, material, label="Custom"):
 
 
 def _ensure_custom_output(tree):
-    """Give the group one output per channel, whatever the document uses.
+    """Give the group its one output, if it has not got it.
 
-    **All five, always** -- not only the channels the document has switched
-    on. The group is the user's workspace: they build a normal there before
-    turning the Normal channel on, and a socket that appears and disappears
-    under their hands would take their links with it. Which of the five is
-    actually read is the *layer's* business (`layer.channel(...).enabled`),
-    and that is a checkbox, not a rewiring.
+    Only ever added, never removed: the group is the user's workspace, and an
+    older group's extra sockets are theirs to keep or delete.
     """
-    from . import document as doc
-
     existing = {
         item.name: item
         for item in tree.interface.items_tree
         if item.item_type == 'SOCKET' and item.in_out == 'OUTPUT'
     }
 
-    for identifier in doc.CHANNEL_IDS:
-        name = doc.channel_label(identifier)
-        if name in existing:
-            continue
+    # One output, whatever the material carries: which channels
+    # it drives, and by how much, is the layer's business. P3 spreads it over
+    # the other channels; until then it is the colour.
+    if CUSTOM_OUTPUT not in existing:
         tree.interface.new_socket(
-            name,
-            in_out='OUTPUT',
-            socket_type='NodeSocketColor'
-            if doc.channel_kind(identifier) == 'COLOR'
-            else 'NodeSocketFloat',
+            CUSTOM_OUTPUT, in_out='OUTPUT', socket_type='NodeSocketColor'
         )
 
     return tree.interface.items_tree

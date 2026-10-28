@@ -111,6 +111,13 @@ METER = (0.303, 0.388, 0.515, 1.0)
 # about selection at all, so it must not be a shade of it.
 EFFECT_MARK = (0.361, 0.784, 0.435, 1.0)
 
+# The frame round the row being soloed. Green and thick enough to read at a
+# glance (the user's ask): a one-pixel line in the selection blue sat on top
+# of a selected row's own blue edge and was barely there. Not a selection, so
+# not a shade of it -- the same green as the effect mark.
+SOLO_FRAME = (0.361, 0.784, 0.435, 0.9)
+SOLO_FRAME_WIDTH = 2
+
 # List rows. Blender highlights the hovered row with a translucent white wash
 # rather than a second opaque colour, which is why LIST_HOVER has alpha.
 LIST_SEL = (0.278, 0.447, 0.702, 1.0)

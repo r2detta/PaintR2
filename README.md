@@ -81,7 +81,10 @@ baking, saving layer images and export — happens in the PaintR2 workspace.
 
 **Layers**
 - Add, delete, reorder, hide; drag and drop to move
-- 19 blend modes and opacity
+- Blend mode and opacity **per channel**, picked from the channel menu in the
+  Layers header
+- Right-click a layer, its colour or its mask for the commands that belong to
+  what you clicked
 - **Groups** — nested, with the group's mask and opacity applied to the whole
   subtree
 - Layer masks, and viewing a mask on its own
@@ -101,16 +104,28 @@ baking, saving layer images and export — happens in the PaintR2 workspace.
 - Box and lasso selection, drag to fill, edge softening and bleed
 - Its own undo ring (`Ctrl Z`)
 
+**Channels**
+- **Base Color, Roughness, Metallic, Normal and Height** on every material
+- A layer writes to the channels you switch on in its Properties; new layers
+  start with Base Color only
+- Fill layers can take an **image in any channel** — a colour map, a roughness
+  map, a normal map — placed by UV or Planar projection with position,
+  rotation and (uniform) scale; DirectX normal maps are converted on the fly
+- Height adds up between layers; normal detail is combined onto the baked
+  high-poly normal rather than replacing it
+
 **Procedural and adjustment**
 - Your own node group as a layer or as a mask — and it can read the baked
-  mesh maps (AO, curvature, …) as inputs
+  mesh maps (AO, curvature, …) as inputs; its one output drives whichever
+  channels the layer writes to
 - Adjustment layers: HSV, Levels, Bright/Contrast, Gamma, Clamp, Posterize,
   Invert
 - A per-layer effect stack
 
 **Preview and export**
-- **Base Color** is the one channel for now; it is exported per material as
-  PNG, OpenEXR, Targa or JPEG
+- **Bake and export the final textures** per material: Base Color,
+  Roughness, Metallic, Normal (with the height baked in, OpenGL or DirectX)
+  and Height — pick which ones, as PNG, OpenEXR, Targa or JPEG
 - Preview modes: PBR, Unlit, Diffuse, and a baked mesh map on its own
 - Lighting, HDRI and view transform controls inside the workspace
 
@@ -181,9 +196,8 @@ The release binaries are built by `.github/workflows/build.yml`.
   unrecoverable loss. If you started wrong, the way out is a new material.
 - **One PaintR2 session at a time.**
 - **No UDIM.** A single UV tile.
-- **Base Color only.** Roughness, Metallic, Normal and Height were taken out in
-  0.11 until they can be done properly; Metallic and Roughness are planned to
-  come back.
+- **The brush paints Base Color only.** Roughness, Metallic, Normal and Height
+  are given by Fill layers (a value or an image) and shaped with masks.
 - No smart materials or smart masks.
 
 

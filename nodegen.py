@@ -6,11 +6,12 @@ goes into a node group named `PaintR2 <material>`, which is rebuilt from
 scratch on every change. Nothing inside that group is meant to be edited by
 hand -- edits belong outside it, where they survive.
 
-The group carries **one output per channel** the document uses -- today
-that is Base Color alone -- and the material is wired through a
-Principled BSDF:
+The group carries **one output per channel**, all five always,
+and the material is wired through a Principled BSDF:
 
-    [PaintR2 group] Base Color -> [Principled] -> [Material Output]
+    Base Color, Roughness, Metallic ---------------------> [Principled]
+    Normal -> [Normal Map] -> [Bump].Normal
+    Height ------------------> [Bump].Height --> Principled.Normal
 
 That is the PBR mode, and the default. Two other modes wire the same group
 to the same output differently, because judging a painted colour and judging a
@@ -32,11 +33,15 @@ transforms the running result instead, and the transformed version is mixed
 back over the untransformed one by the same factor everything else uses. So
 its mask still means "where" and its opacity still means "how much".
 
-Compositing rule, applied bottom to top, **once per channel**:
+Compositing rule, applied bottom to top, **once per channel**, with that
+channel's own blend mode and opacity:
 
     factor = layer_alpha * mask * opacity   (Base Color of a PAINT layer)
     factor = mask * opacity                 (everything else)
     result = Mix(blend_mode, factor, result, layer_contribution)
+
+Normal is the exception to *how* it mixes: its two own modes, Detail and
+Combine, add the layer's detail onto the surface below (`_mix_normal`).
 
 `layer_alpha` exists only for Base Color, and only on a PAINT layer, because
 the brush only ever paints Base Color. Every other channel of every
@@ -61,8 +66,8 @@ Blender 5.2 specifics that matter here, all measured:
     ShaderNodeMath instead, via `_SCALAR_BLEND`, and the ones with no float
     equivalent fall back to a lerp.
   * **Math node output is not clamped**: ADD gives 1.1, SUBTRACT gives -0.7.
-    Every scalar channel is clamped on the way out (`_CLAMPED`; none exist
-    while Base Color is the only channel).
+    Roughness and Metallic are clamped on the way out (`_CLAMPED`); Height is
+    clamped to its own -1..1.
   * Removing an output socket from a group interface **silently drops** the
     link that fed from it, and re-adding the socket does not bring the link
     back. So changing the channel set means re-wiring the material, which is
@@ -90,7 +95,9 @@ _CHANNEL_BAND = 1400.0
 # socket -- making it a vector would mean a conversion node at both ends.
 _SOCKET_TYPES = {
     'COLOR': 'NodeSocketColor',
+    'NORMAL': 'NodeSocketColor',
     'FLOAT': 'NodeSocketFloat',
+    'SIGNED': 'NodeSocketFloat',
 }
 
 # Blend modes that mean something for a single float, and the Math operation
@@ -109,11 +116,45 @@ _SCALAR_BLEND = {
     'DIFFERENCE': 'ABSOLUTE',
 }
 
-# Scalar channels whose result is clamped to 0..1 before it leaves the group:
-# Math nodes do not clamp (ADD gives 1.1, SUBTRACT -0.7). Empty while Base
-# Color is the only channel; every scalar channel that comes back is
-# defined on 0..1 and belongs here.
-_CLAMPED = frozenset()
+# Scalar channels whose result is clamped before it leaves the group, and to
+# what: Math nodes do not clamp (ADD gives 1.1, SUBTRACT -0.7). Height adds by
+# default, so two layers at 0.8 would otherwise leave the range the value is
+# defined on.
+_CLAMPED = {
+    'ROUGHNESS': (0.0, 1.0),
+    'METALLIC': (0.0, 1.0),
+    'HEIGHT': (-1.0, 1.0),
+}
+
+
+def blend_modes_for(channel):
+    """The blend modes that mean something in `channel`, in menu order.
+
+    The compiler's own answer, so the menu (P2) and the compile cannot
+    disagree: a scalar channel gets the modes `_SCALAR_BLEND` can do plus a
+    plain lerp, Normal gets its two plus a copy, Base Color everything.
+    """
+    from . import document as doc
+
+    kind = doc.channel_kind(channel)
+    if kind == 'COLOR':
+        return [item[0] for item in doc.BLEND_MODES]
+    if kind == 'NORMAL':
+        return [item[0] for item in doc.NORMAL_BLEND_MODES] + ['MIX']
+    return ['MIX'] + [
+        item[0] for item in doc.BLEND_MODES if item[0] in _SCALAR_BLEND
+    ]
+
+
+def _channel_blend(layer, channel):
+    """The layer's blend in `channel`, or the channel's default if the stored
+    mode means nothing there -- a Detail left on a record by hand, say."""
+    from . import document as doc
+
+    mode = layer.channel_blend(channel)
+    if mode in blend_modes_for(channel):
+        return mode
+    return doc.channel_blend_default(channel)
 
 
 # --- socket helpers ---------------------------------------------------------
@@ -196,7 +237,7 @@ def _ensure_group_outputs(group, document):
 
     wanted = [
         (doc.channel_label(identifier), doc.channel_kind(identifier))
-        for identifier in document.active_channels()
+        for identifier in doc.CHANNEL_IDS
     ]
     wanted_names = [name for name, _kind in wanted]
 
@@ -241,30 +282,35 @@ def _paint_base_color(group, layer, x, y):
 
 
 def _flat_color(group, layer, channel, x, y, index=-1):
-    """A channel's constant colour, as an RGB node."""
+    """A channel's constant colour, as an RGB node: Base Color's, or Normal's."""
     node = group.nodes.new('ShaderNodeRGB')
     node.label = f"{layer.name} {channel.lower()}"
     node.location = (x, y)
-    node.outputs[0].default_value = tuple(layer.channel(channel).color)
+    node.outputs[0].default_value = tuple(layer.channel_value(channel))
     _bind_flat(node, index, channel)
     return node.outputs[0], None
 
 
 def _flat_value(group, layer, channel, x, y, index=-1):
-    """A channel's constant scalar, as a Value node."""
+    """A channel's constant scalar, as a Value node. Height's may be negative."""
     node = group.nodes.new('ShaderNodeValue')
     node.label = f"{layer.name} {channel.lower()}"
     node.location = (x, y)
-    node.outputs[0].default_value = float(layer.channel(channel).value)
+    node.outputs[0].default_value = float(layer.channel_value(channel))
     _bind_flat(node, index, channel)
     return node.outputs[0], None
 
 
 def _flat(group, layer, channel, x, y, index=-1):
-    """Whichever of the two the channel's kind calls for."""
+    """Whichever source the channel's kind calls for.
+
+    Normal is a colour like Base Color: the layer's `normal_color`, flat
+    (0.5, 0.5, 1) until the user tints it. A flat one changes nothing under
+    Detail or Combine and flattens what is below under Normal (copy).
+    """
     from . import document as doc
 
-    if doc.channel_kind(channel) == 'COLOR':
+    if doc.channel_is_color(channel):
         return _flat_color(group, layer, channel, x, y, index)
     return _flat_value(group, layer, channel, x, y, index)
 
@@ -281,11 +327,12 @@ def _layer_channel_source(group, layer, channel, x, y, index=-1):
 
         PAINT       Base Color  -> image + alpha
                     others      -> nothing (the brush paints Base Color only)
-        FILL        any         -> flat value
+        FILL        any         -> flat value (Normal: a flat normal)
         PROCEDURAL  Base Color  -> the pattern, mixed between two colours
-                    others      -> flat value (the pattern does not modulate
-                                   them; put the pattern on the mask for that)
-        CUSTOM      any         -> the node group's own output for it
+                    others      -> flat value, until P3 drives them with the
+                                   pattern
+        CUSTOM      Base Color  -> the node group's one output; the other
+                                   channels get it in P3
     """
     from . import procedural
 
@@ -297,24 +344,204 @@ def _layer_channel_source(group, layer, channel, x, y, index=-1):
         return _paint_base_color(group, layer, x, y)
 
     if kind == 'FILL':
+        if layer.channel(channel).image is not None:
+            return _image_source(group, layer, channel, x, y, index)
         return _flat(group, layer, channel, x, y, index)
 
     if kind == 'PROCEDURAL':
-        # A Custom pattern is a node group with an output per channel, so it
-        # is the one kind that can drive more than Base Color with a picture.
-        if procedural.edits_in_graph(layer.procedural.kind):
-            found = procedural.build_channel(
-                group, layer.procedural, channel, x, y
-            )
-            return (found, None) if found is not None else (None, None)
-
-        if channel == 'BASE_COLOR':
-            color = procedural.build_color(group, layer.procedural, x, y)
-            return (color, None) if color is not None else (None, None)
-
-        return _flat(group, layer, channel, x, y, index)
+        return _pattern_source(group, layer, channel, x, y, index)
 
     return None, None
+
+
+# --- channel images ---------------------------------
+
+_MAPPING_PREFIX = "PR2 mapping"
+_PROJECTED_PREFIX = "PR2 projected"
+
+# Which two of the model's own coordinates a Planar projection reads, by the
+# axis it looks along.
+_PLANAR_AXES = {'X': ("Y", "Z"), 'Y': ("X", "Z"), 'Z': ("X", "Y")}
+
+
+def _mapping_node_name(index):
+    return f"{_MAPPING_PREFIX} {index}"
+
+
+def _projected(group, layer, x, y, index):
+    """The layer's projected texture coordinate, built once per layer.
+
+    Every image in the layer reads the same socket: a colour map and its
+    normal map stay registered with each other. Found again by name rather
+    than cached, the way a flat value's node is -- the name says which layer.
+
+        UV      UV - 0.5 -> Mapping -> + 0.5      turns and scales about the
+                                                  middle of the picture
+        Planar  Object -> Mapping -> two axes -> + 0.5
+                                                  centred on the model's origin
+
+    Mapping is TEXTURE type: Position moves the picture, Rotation turns it,
+    Scale makes it bigger -- the way a texture transform reads, rather than
+    the inverse a POINT mapping would give.
+    """
+    name = f"{_PROJECTED_PREFIX} {index}"
+    found = group.nodes.get(name)
+    if found is not None:
+        return found.outputs[0]
+
+    proj = layer.projection
+    left = x - 1300.0
+    coords = group.nodes.new('ShaderNodeTexCoord')
+    coords.location = (left, y + 300.0)
+
+    if proj.mode == 'PLANAR':
+        source = coords.outputs["Object"]
+    else:
+        centred = group.nodes.new('ShaderNodeVectorMath')
+        centred.operation = 'SUBTRACT'
+        centred.location = (left + 180.0, y + 300.0)
+        group.links.new(coords.outputs["UV"], centred.inputs[0])
+        centred.inputs[1].default_value = (0.5, 0.5, 0.0)
+        source = centred.outputs[0]
+
+    mapping = group.nodes.new('ShaderNodeMapping')
+    mapping.vector_type = 'TEXTURE'
+    mapping.name = _mapping_node_name(index)
+    mapping.label = f"{layer.name} projection"
+    mapping.location = (left + 360.0, y + 300.0)
+    group.links.new(source, mapping.inputs["Vector"])
+    _write_mapping(mapping, proj)
+    vector = mapping.outputs["Vector"]
+
+    if proj.mode == 'PLANAR':
+        split = group.nodes.new('ShaderNodeSeparateXYZ')
+        split.location = (left + 560.0, y + 300.0)
+        group.links.new(vector, split.inputs[0])
+        joined = group.nodes.new('ShaderNodeCombineXYZ')
+        joined.location = (left + 740.0, y + 300.0)
+        first, second = _PLANAR_AXES.get(proj.axis, ("X", "Y"))
+        group.links.new(split.outputs[first], joined.inputs["X"])
+        group.links.new(split.outputs[second], joined.inputs["Y"])
+        vector = joined.outputs[0]
+
+    back = group.nodes.new('ShaderNodeVectorMath')
+    back.operation = 'ADD'
+    back.name = name
+    back.location = (left + 920.0, y + 300.0)
+    group.links.new(vector, back.inputs[0])
+    back.inputs[1].default_value = (0.5, 0.5, 0.0)
+    return back.outputs[0]
+
+
+def _write_mapping(node, proj):
+    node.inputs["Location"].default_value = tuple(proj.position)
+    node.inputs["Rotation"].default_value = tuple(proj.rotation)
+    node.inputs["Scale"].default_value = tuple(proj.scale)
+
+
+def write_mapping(material, index, proj):
+    """Put a layer's position, rotation and scale into the compiled tree.
+
+    True when done. Dragging a projection value is three numbers on one node,
+    not a new tree -- the opacity argument again.
+    """
+    if material is None:
+        return False
+    group = find_group(material)
+    if group is None:
+        return False
+    node = group.nodes.get(_mapping_node_name(index))
+    if node is None or node.bl_idname != 'ShaderNodeMapping':
+        return False
+    # Mode and axis rebuild the tree on their own hook; only the three
+    # numbers come through here.
+    _write_mapping(node, proj)
+    return True
+
+
+def _image_source(group, layer, channel, x, y, index=-1):
+    """A Fill layer's channel image, as (socket, alpha).
+
+        Base Color  the picture, its alpha carving the layer like a paint
+                    layer's does
+        Normal      the picture as a normal map, green flipped for DirectX
+        the rest    the picture times the slider
+    """
+    from . import document as doc
+
+    record = layer.channel(channel)
+    node = group.nodes.new('ShaderNodeTexImage')
+    node.image = record.image
+    node.extension = 'REPEAT'
+    node.label = f"{layer.name} {channel.lower()}"
+    node.location = (x - 300.0, y)
+    group.links.new(_projected(group, layer, x, y, index), node.inputs["Vector"])
+    color = node.outputs["Color"]
+
+    if channel == 'BASE_COLOR':
+        return color, node.outputs["Alpha"]
+
+    if doc.channel_kind(channel) == 'NORMAL':
+        if record.flip_green:
+            split = group.nodes.new('ShaderNodeSeparateColor')
+            split.location = (x - 120.0, y)
+            group.links.new(color, split.inputs[0])
+            flip = group.nodes.new('ShaderNodeMath')
+            flip.operation = 'SUBTRACT'
+            flip.location = (x, y - 60.0)
+            flip.inputs[0].default_value = 1.0
+            group.links.new(split.outputs["Green"], flip.inputs[1])
+            joined = group.nodes.new('ShaderNodeCombineColor')
+            joined.location = (x + 120.0, y)
+            group.links.new(split.outputs["Red"], joined.inputs["Red"])
+            group.links.new(flip.outputs[0], joined.inputs["Green"])
+            group.links.new(split.outputs["Blue"], joined.inputs["Blue"])
+            color = joined.outputs[0]
+        return color, None
+
+    amount, _alpha = _flat_value(group, layer, channel, x, y - 160.0, index)
+    return _multiply(group, color, amount, x + 180.0, y,
+                     f"{layer.name} {channel.lower()}"), None
+
+
+def _pattern_source(group, layer, channel, x, y, index=-1):
+    """A pattern layer's contribution to one channel.
+
+        Base Color  the pattern's colour -- a Custom group's one output, or
+                    the factor mixed between the two swatches
+        Normal      a Custom group's output, taken as a normal map; a built-in
+                    pattern has no normal to give, so a flat one
+        the rest    the pattern as a 0..1 factor, times the layer's slider:
+                    black is 0, white is the slider's value
+    """
+    from . import document as doc
+    from . import procedural
+
+    proc = layer.procedural
+    custom = procedural.edits_in_graph(proc.kind)
+
+    if channel == 'BASE_COLOR':
+        if custom:
+            found = procedural.build_channel(group, proc, channel, x, y)
+        else:
+            found = procedural.build_color(group, proc, x, y)
+        return (found, None) if found is not None else (None, None)
+
+    if doc.channel_kind(channel) == 'NORMAL':
+        if not custom:
+            return _flat(group, layer, channel, x, y, index)
+        found = procedural.build_channel(group, proc, channel, x, y)
+        return (found, None) if found is not None else (None, None)
+
+    pattern = (procedural.build_channel(group, proc, channel, x, y) if custom
+               else procedural.build_factor(group, proc, x, y))
+    if pattern is None:
+        return None, None
+    # The slider is its own bound Value node, so dragging it writes one
+    # number rather than rebuilding the pattern.
+    amount, _alpha = _flat_value(group, layer, channel, x, y - 160.0, index)
+    return _multiply(group, pattern, amount, x + 180.0, y,
+                     f"{layer.name} {channel.lower()}"), None
 
 
 def _multiply(group, first, second, x, y, label=""):
@@ -420,7 +647,9 @@ def _mask_socket(group, layer, cache, key, x, y):
 _OPACITY_PREFIX = "PR2 opacity"
 _FLAT_PREFIX = "PR2 flat"
 
-# {node group name: {layer index: [node names]}}. Rebuilt by every compile.
+# {node group name: {(layer index, channel): [node names]}}. Rebuilt by every
+# compile. Per channel because opacity is: dragging Roughness's
+# must not move Base Color's.
 _opacity_bindings = {}
 
 # Filled during a compile and swapped into the map above at the end of it.
@@ -484,13 +713,13 @@ def _bind_opacity(node, index, channel):
     node.name = _opacity_node_name(index, channel)
     # Read back rather than assumed: Blender makes a name unique by appending
     # to it, and a name we did not check is a node we cannot find again.
-    _binding_nodes.setdefault(index, []).append(node.name)
+    _binding_nodes.setdefault((index, channel), []).append(node.name)
 
 
-def _unbind_opacity(index):
+def _unbind_opacity(index, channel):
     """Say that this layer's opacity has nowhere to live in this channel."""
     if _binding_broken is not None and index >= 0:
-        _binding_broken.add(index)
+        _binding_broken.add((index, channel))
 
 
 def _opacity_socket(node):
@@ -504,13 +733,12 @@ def _opacity_socket(node):
     return None
 
 
-def write_opacity(material, index, value):
-    """Put a layer's opacity into the compiled tree without rebuilding it.
+def write_opacity(material, index, value, channel='BASE_COLOR'):
+    """Put a layer's opacity in one channel into the compiled tree.
 
-    True when every channel that layer writes to was updated. False means the
-    tree cannot carry the value as it stands and the caller has to rebuild --
-    which is the honest answer, not a failure: it is what happens the first
-    time a masked layer moves off 1.0.
+    True when it was done. False means the tree cannot carry the value as it
+    stands and the caller has to rebuild -- which is the honest answer, not a
+    failure: it is what happens the first time a masked layer moves off 1.0.
     """
     if material is None:
         return False
@@ -519,12 +747,12 @@ def write_opacity(material, index, value):
     if group is None:
         return False
 
-    names = _opacity_bindings.get(group.name, {}).get(int(index))
+    names = _opacity_bindings.get(group.name, {}).get((int(index), channel))
     if not names:
         return False
 
-    # Every socket is found before any is written: a half-applied opacity is
-    # a layer that is one value in Base Color and another in Roughness.
+    # Every socket is found before any is written. One channel can still be
+    # several nodes: a group's opacity is bound once per level it mixes at.
     targets = []
     for name in names:
         target = _opacity_socket(group.nodes.get(name))
@@ -560,11 +788,13 @@ def _layer_factor(group, layer, alpha_socket, mask, x, y,
       so the layer is marked unwritable and the next change rebuilds.
     """
     factors = [item for item in (alpha_socket, mask) if item is not None]
+    opacity = float(layer.channel_opacity(channel)) if channel else float(
+        layer.opacity)
 
-    if layer.opacity < 1.0 or not factors:
-        factors.append(float(layer.opacity))
+    if opacity < 1.0 or not factors:
+        factors.append(opacity)
     else:
-        _unbind_opacity(index)
+        _unbind_opacity(index, channel)
 
     result = factors[0]
     last = None
@@ -577,7 +807,7 @@ def _layer_factor(group, layer, alpha_socket, mask, x, y,
 
     # The opacity was appended last, so if anything was multiplied at all it
     # is the second input of the final Math node.
-    if last is not None and layer.opacity < 1.0:
+    if last is not None and opacity < 1.0:
         _bind_opacity(last.node, index, channel)
 
     return result
@@ -677,7 +907,11 @@ def _mix(group, channel, blend_mode, factor, below_socket, layer_socket, x, y,
     from . import document as doc
 
     if is_color is None:
-        is_color = doc.channel_kind(channel) == 'COLOR'
+        if doc.channel_kind(channel) == 'NORMAL':
+            return _mix_normal(
+                group, blend_mode, factor, below_socket, layer_socket, x, y
+            )
+        is_color = doc.channel_is_color(channel)
 
     if is_color:
         return _mix_color(
@@ -689,29 +923,166 @@ def _mix(group, channel, blend_mode, factor, below_socket, layer_socket, x, y,
 
 
 def _clamp(group, channel, value_socket, x, y):
-    """Keep a scalar channel inside 0..1 on its way out of the group.
+    """Keep a scalar channel inside its range on its way out of the group.
 
     Math nodes do not clamp: ADD gives 1.1 and SUBTRACT gives -0.7 (measured).
-    A roughness of 1.1 reaching Principled is not a look, it is a bug.
+    A roughness of 1.1 reaching Principled is not a look, it is a bug; a
+    height past 1 is two layers that added up to more than the range means.
     """
-    if channel not in _CLAMPED:
+    bounds = _CLAMPED.get(channel)
+    if bounds is None:
         return value_socket
 
     node = group.nodes.new('ShaderNodeClamp')
-    node.label = f"{channel.lower()} 0..1"
+    node.label = f"{channel.lower()} {bounds[0]:g}..{bounds[1]:g}"
     node.location = (x, y)
     group.links.new(value_socket, node.inputs["Value"])
-    node.inputs["Min"].default_value = 0.0
-    node.inputs["Max"].default_value = 1.0
+    node.inputs["Min"].default_value = bounds[0]
+    node.inputs["Max"].default_value = bounds[1]
     return node.outputs["Result"]
 
 
-def _backdrop(group, channel, x, y):
-    """What a channel reads where no layer contributes."""
+# --- normal blending ----------------------------------------------------------
+#
+# A tangent-space normal travels through the group as a colour (that is what
+# the Normal Map node at the end wants), and is turned back into a direction
+# only where two of them meet. Both formulas were checked against a numpy
+# reference to four decimals, and both leave a flat normal on either side
+# exactly alone -- which is what makes an untouched Normal channel harmless
+#.
+
+
+def _vector_math(group, operation, x, y, *inputs):
+    node = group.nodes.new('ShaderNodeVectorMath')
+    node.operation = operation
+    node.location = (x, y)
+    for position, value in enumerate(inputs):
+        if value is None:
+            continue
+        if isinstance(value, tuple):
+            node.inputs[position].default_value = value
+        else:
+            group.links.new(value, node.inputs[position])
+    return node
+
+
+def _decode_normal(group, color, x, y):
+    """Colour 0..1 to a unit direction. Normalised on the way in, because the
+    lerp that made the colour below shortens it between two directions."""
+    vector = _vector_math(
+        group, 'MULTIPLY_ADD', x, y, color, (2.0, 2.0, 2.0), (-1.0, -1.0, -1.0)
+    ).outputs[0]
+    return _vector_math(group, 'NORMALIZE', x + 160.0, y, vector).outputs[0]
+
+
+def _encode_normal(group, vector, x, y):
+    return _vector_math(
+        group, 'MULTIPLY_ADD', x, y, vector, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5)
+    ).outputs[0]
+
+
+def _reoriented(group, base, detail, x, y):
+    """Reoriented normal mapping (Barré-Brisebois & Hill): `detail` turned to
+    follow `base`'s surface. The Detail blend mode."""
+    t = _vector_math(group, 'ADD', x, y, base, (0.0, 0.0, 1.0)).outputs[0]
+    u = _vector_math(
+        group, 'MULTIPLY', x, y - 140.0, detail, (-1.0, -1.0, 1.0)
+    ).outputs[0]
+    dot = _vector_math(group, 'DOT_PRODUCT', x + 160.0, y, t, u).outputs["Value"]
+
+    split = group.nodes.new('ShaderNodeSeparateXYZ')
+    split.location = (x + 160.0, y + 140.0)
+    group.links.new(t, split.inputs[0])
+
+    ratio = group.nodes.new('ShaderNodeMath')
+    ratio.operation = 'DIVIDE'
+    ratio.location = (x + 320.0, y)
+    group.links.new(dot, ratio.inputs[0])
+    group.links.new(split.outputs["Z"], ratio.inputs[1])
+
+    scaled = group.nodes.new('ShaderNodeVectorMath')
+    scaled.operation = 'SCALE'
+    scaled.location = (x + 480.0, y)
+    group.links.new(t, scaled.inputs[0])
+    group.links.new(ratio.outputs[0], scaled.inputs["Scale"])
+
+    result = _vector_math(
+        group, 'SUBTRACT', x + 640.0, y, scaled.outputs[0], u
+    ).outputs[0]
+    return _vector_math(group, 'NORMALIZE', x + 800.0, y, result).outputs[0]
+
+
+def _whiteout(group, base, detail, x, y):
+    """Whiteout blending: (xy + xy, z * z), normalised. The Combine blend
+    mode."""
+    added = _vector_math(group, 'ADD', x, y, base, detail).outputs[0]
+    product = _vector_math(group, 'MULTIPLY', x, y - 140.0, base, detail).outputs[0]
+
+    xy = group.nodes.new('ShaderNodeSeparateXYZ')
+    xy.location = (x + 160.0, y)
+    group.links.new(added, xy.inputs[0])
+    z = group.nodes.new('ShaderNodeSeparateXYZ')
+    z.location = (x + 160.0, y - 140.0)
+    group.links.new(product, z.inputs[0])
+
+    joined = group.nodes.new('ShaderNodeCombineXYZ')
+    joined.location = (x + 320.0, y)
+    group.links.new(xy.outputs["X"], joined.inputs["X"])
+    group.links.new(xy.outputs["Y"], joined.inputs["Y"])
+    group.links.new(z.outputs["Z"], joined.inputs["Z"])
+    return _vector_math(
+        group, 'NORMALIZE', x + 480.0, y, joined.outputs[0]
+    ).outputs[0]
+
+
+_NORMAL_BLENDERS = {
+    'DETAIL': _reoriented,
+    'COMBINE': _whiteout,
+}
+
+
+def _mix_normal(group, blend_mode, factor, below_socket, layer_socket, x, y):
+    """Blend one layer's normal over the one below. Returns a colour socket.
+
+    Detail and Combine build the blended direction first and then let the
+    factor fade between it and what was below, as colours -- so the last node
+    is the same RGBA Mix every other channel ends in, and a bare opacity lands
+    on its Factor where `write_opacity` can find it. Normal (MIX) is a copy,
+    the plain lerp alone.
+    """
+    blender = _NORMAL_BLENDERS.get(blend_mode)
+    top = layer_socket
+    if blender is not None:
+        left = x - 1400.0
+        base = _decode_normal(group, below_socket, left, y + 300.0)
+        detail = _decode_normal(group, layer_socket, left, y + 100.0)
+        blended = blender(group, base, detail, left + 340.0, y + 200.0)
+        top = _encode_normal(group, blended, x - 180.0, y + 200.0)
+
+    return _mix_color(group, 'MIX', factor, below_socket, top, x, y)
+
+
+def _backdrop(group, channel, x, y, material=None):
+    """What a channel reads where no layer contributes.
+
+    Normal's is the model's own baked normal when there is one:
+    the bottom of the stack, so every layer's detail lands on the high-poly's
+    shape, and a layer on Normal (copy) can still flatten it where its mask
+    says. Putting it at the bottom is what lets one blend mode do both jobs.
+    """
     from . import document as doc
 
     default = doc.channel_default(channel)
-    if doc.channel_kind(channel) == 'COLOR':
+    if doc.channel_kind(channel) == 'NORMAL':
+        image = _mesh_normal(material)
+        if image is not None:
+            node = group.nodes.new('ShaderNodeTexImage')
+            node.image = image
+            node.label = "baked normal"
+            node.location = (x - 300.0, y)
+            return node.outputs["Color"]
+
+    if doc.channel_is_color(channel):
         node = group.nodes.new('ShaderNodeRGB')
         node.outputs[0].default_value = tuple(default)
     else:
@@ -721,6 +1092,18 @@ def _backdrop(group, channel, x, y):
     node.label = f"{channel.lower()} backdrop"
     node.location = (x, y)
     return node.outputs[0]
+
+
+def _mesh_normal(material):
+    """The baked high-poly normal for `material`, or None."""
+    if material is None:
+        return None
+    from . import meshmaps
+
+    try:
+        return meshmaps.stored(material, 'NORMAL')
+    except (AttributeError, KeyError, TypeError):
+        return None
 
 
 # --- compilation ------------------------------------------------------------
@@ -769,8 +1152,8 @@ def _composite(node_group, document, channel, indices, result, cursor, cache):
             factor = _layer_factor(node_group, layer, None, mask, cursor, y,
                                    index, channel)
             result = _mix(
-                node_group, channel, layer.blend_mode, factor, result, inner,
-                cursor + _COLUMN_WIDTH, band,
+                node_group, channel, _channel_blend(layer, channel), factor,
+                result, inner, cursor + _COLUMN_WIDTH, band,
             )
             _bind_bare_opacity(result, factor, index, channel)
             cursor += _COLUMN_WIDTH * 2
@@ -822,8 +1205,8 @@ def _composite(node_group, document, channel, indices, result, cursor, cache):
         factor = _layer_factor(node_group, layer, alpha_socket, mask, cursor, y,
                                index, channel)
         result = _mix(
-            node_group, channel, layer.blend_mode, factor, result, color_socket,
-            cursor + _COLUMN_WIDTH, band,
+            node_group, channel, _channel_blend(layer, channel), factor,
+            result, color_socket, cursor + _COLUMN_WIDTH, band,
         )
         _bind_bare_opacity(result, factor, index, channel)
         cursor += _COLUMN_WIDTH * 2
@@ -854,8 +1237,8 @@ def compile_group(group, document):
         return _compile_group(group, document)
     finally:
         _opacity_bindings[group.name] = {
-            index: names for index, names in _binding_nodes.items()
-            if index not in _binding_broken
+            key: names for key, names in _binding_nodes.items()
+            if key not in _binding_broken
         }
         _binding_nodes = _binding_broken = None
 
@@ -882,7 +1265,7 @@ def _compile_group(group, document):
 
     for channel in active:
         band = _band_y(channel)
-        backdrop = _backdrop(group, channel, 0.0, band)
+        backdrop = _backdrop(group, channel, 0.0, band, document.id_data)
 
         if solo_mode == 'MASK':
             result, cursor = backdrop, _COLUMN_WIDTH
@@ -940,10 +1323,10 @@ _OWNED = {
 _FADE_NODES = {"fade_info", "fade_dark", "fade_mix"}
 
 _MODE_NODES = {
-    # "bump" and "normal_map" are in no mode any more. They stay in
-    # _OWNED so a file saved with a Normal or Height channel has them pruned.
-    'PBR': {"group", "bsdf", "output"},
-    'DIFFUSE': {"group", "bsdf", "output"},
+    'PBR': {"group", "bsdf", "bump", "normal_map", "output"},
+    # Diffuse keeps the surface detail: it exists to read the form, and the
+    # normal and height are form.
+    'DIFFUSE': {"group", "bsdf", "bump", "normal_map", "output"},
     'UNLIT': {"group", "emission", "output"},
     # The stack is still compiled and the group node still there -- switching
     # to a map preview and back must not disturb a single layer.
@@ -1206,6 +1589,45 @@ def ensure_material_wiring(material, group):
     return group_node
 
 
+# How far a height of 1.0 lifts the surface, in world units -- the Bump
+# node's Distance. A fixed number, deliberately: no
+# multiplier to set. Measured on a 2 m plane, a soft step to 0.3 tilts the
+# normal 5.5 degrees at this value -- visible without turning every brush edge
+# into a cliff. Being a world unit, it reads stronger on a small model and
+# weaker on a large one; that is accepted until it turns out to matter.
+HEIGHT_DISTANCE = 0.02
+
+
+def _wire_surface_detail(tree, group_node, bsdf):
+    """Normal -> Normal Map -> Bump, Height -> Bump, Bump -> Principled.
+
+    The same chain always: every material carries both channels,
+    and an untouched pair is a flat normal and a height of 0, which bend
+    nothing. Normal goes *under* the bump rather than competing with it for
+    Principled's one socket, so a height painted over a normal map adds to it.
+    Measured: Cycles' tangent normal bake reads this whole chain, so an
+    export can take normal and height together in one bake.
+    """
+    normal_map = _owned_node(
+        tree, "normal_map", 'ShaderNodeNormalMap', (-380.0, -420.0)
+    )
+    normal_map.space = 'TANGENT'
+    bump = _owned_node(tree, "bump", 'ShaderNodeBump', (-260.0, -260.0))
+    bump.invert = False
+    _set_input(bump, "Strength", 1.0)
+    _set_input(bump, "Distance", HEIGHT_DISTANCE)
+
+    normal = group_node.outputs.get("Normal")
+    if normal is not None:
+        tree.links.new(normal, normal_map.inputs["Color"])
+    height = group_node.outputs.get("Height")
+    if height is not None:
+        tree.links.new(height, bump.inputs["Height"])
+
+    tree.links.new(normal_map.outputs["Normal"], bump.inputs["Normal"])
+    tree.links.new(bump.outputs["Normal"], bsdf.inputs["Normal"])
+
+
 def _wire_principled(tree, document, group_node, mode):
     """PBR and Diffuse. Returns the socket to drive the output with."""
     bsdf = _owned_node(tree, "bsdf", 'ShaderNodeBsdfPrincipled', (-120.0, 0.0))
@@ -1213,6 +1635,8 @@ def _wire_principled(tree, document, group_node, mode):
     source = _channel_output(group_node, document, 'BASE_COLOR')
     if source is not None:
         tree.links.new(source, bsdf.inputs["Base Color"])
+
+    _wire_surface_detail(tree, group_node, bsdf)
 
     if mode == 'DIFFUSE':
         # Written rather than linked, so the channels keep their values in the
@@ -1224,11 +1648,11 @@ def _wire_principled(tree, document, group_node, mode):
         _set_input(bsdf, "IOR", 1.0)
         return bsdf.outputs["BSDF"]
 
-    # Principled's own defaults, written back: there is no Roughness or
-    # Metallic channel to drive them, and Diffuse may have left its
-    # values on this node.
-    _set_input(bsdf, "Metallic", 0.0)
-    _set_input(bsdf, "Roughness", 0.5)
+    for channel, name in (('ROUGHNESS', "Roughness"), ('METALLIC', "Metallic")):
+        output = _channel_output(group_node, document, channel)
+        if output is not None:
+            tree.links.new(output, bsdf.inputs[name])
+    # Diffuse may have left its own IOR on this node.
     _set_input(bsdf, "IOR", 1.5)
     return bsdf.outputs["BSDF"]
 

@@ -126,6 +126,14 @@ class PR2_Effect(PropertyGroup):
         update=_recompile,
     )
 
+    def writes(self, channel):
+        """Whether this effect acts on `channel`.
+
+        Only a content effect asks: a mask is one 0..1 factor for every
+        channel, so a mask effect has no channel to choose.
+        """
+        return bool(getattr(self, "on_" + channel.lower(), False))
+
     def label(self):
         """What the row says: the kind it currently is.
 
@@ -139,6 +147,25 @@ class PR2_Effect(PropertyGroup):
         if self.effect_type == 'PAINT':
             return "Paint"
         return procedural.kind_label(self.pattern.kind)
+
+
+def _add_channel_switches():
+    """One switch per channel, `on_<channel>`, written from the table.
+
+    Base Color's starts on: every effect in a file from before this switch
+    acted on Base Color, the only channel there was, and must go on doing
+    exactly that. A new effect is given the channel the rows are showing
+    instead (`add`).
+    """
+    from . import document as doc
+
+    for identifier in doc.CHANNEL_IDS:
+        PR2_Effect.__annotations__["on_" + identifier.lower()] = BoolProperty(
+            name=doc.channel_label(identifier),
+            description=f"Apply this effect to {doc.channel_label(identifier)}",
+            default=identifier == 'BASE_COLOR',
+            update=_recompile,
+        )
 
 
 def _blend_items():
@@ -218,7 +245,7 @@ def apply_stack(group, stack, channel, socket, x, y, is_mask=False):
     if not len(stack):
         return socket
 
-    is_color = (not is_mask) and doc.channel_kind(channel) == 'COLOR'
+    is_color = (not is_mask) and doc.channel_is_color(channel)
     cursor = x
 
     # Index 0 is the top of the list and applied last, so the walk is
@@ -230,6 +257,11 @@ def apply_stack(group, stack, channel, socket, x, y, is_mask=False):
 
         produced = None
         alpha = None
+        # A content effect acts on the channels it was given; a mask
+        # effect acts on the mask, which is every channel at once.
+        if not is_mask and not effect.writes(channel):
+            continue
+
         if effect.effect_type == 'FILTER':
             if socket is None:
                 # Nothing to filter. A filter with no input is not an error;
@@ -296,7 +328,7 @@ DEFAULT_KIND = {
 }
 
 
-def add(layer, effect_type, kind="", on_mask=False, index=-1):
+def add(layer, effect_type, kind="", on_mask=False, index=-1, channel=None):
     """Add an effect and return it. `index` -1 means "at the top".
 
     `kind` is optional: an effect added without one starts at its type's
@@ -318,6 +350,14 @@ def add(layer, effect_type, kind="", on_mask=False, index=-1):
         effect.pattern.enabled = True
     # PAINT gets its image from the operator, which is the only caller that
     # knows the material's name and the document's resolution.
+
+    # The channel it acts on: the one the rows are showing when it was added
+    #. Changed afterwards from its own chips.
+    if channel is not None:
+        from . import document as doc
+
+        for identifier in doc.CHANNEL_IDS:
+            setattr(effect, "on_" + identifier.lower(), identifier == channel)
 
     # Added at the end, then moved to where it belongs: a collection can only
     # append, and "the top of the list" is index 0.
@@ -384,6 +424,7 @@ CLASSES = (PR2_Effect,)
 
 
 def register():
+    _add_channel_switches()
     for cls in CLASSES:
         bpy.utils.register_class(cls)
 

@@ -44,6 +44,12 @@ Row kinds
 ``preview``    a square picture, nothing to click    -- ``texture``
 ``panel``      a collapsible group                   -- ``rows``, ``toggle``
 ``curve``      the falloff curve editor              -- ``samples``, ``points``
+``vector``     several numbers on one row, side by side -- ``fields``: a list
+               of ``value`` rows, each with its component in its key
+               (``position[1]``) and a ``prefix`` drawn inside it ("Y")
+``chips``      independent toggles, drawn as segments -- ``chips``: a list of
+               ``{owner, key, value, label, desc}``; the full row width, no
+               label column. A layer's channels.
 
 Every row may carry ``suffix``: the small square toggles Blender aligns onto
 the end of a row -- pressure, overlay visibility, "unified" -- as a list of
@@ -73,6 +79,8 @@ SUFFIX_ICONS = {
     'PLUS': icons.plus,
     'CROSS': icons.cross,
     'FOLDER': icons.folder,
+    'IMAGE': icons.image,
+    'LINK': icons.link,
 }
 
 
@@ -314,6 +322,11 @@ class PropertyPanel(Widget):
         type's name in the empty field and a texture called "Texture" then
         looked exactly like no texture at all.
         """
+        # With a label the row is split like every other property row: the
+        # name on the left, the slot in the value column -- a channel image
+        # that does not say which channel it is in reads as a stray file.
+        if row.get("label"):
+            rect = self._columns(rect)[1]
         x, y, width, height = rect
         button = self.px(self.SUFFIX)
         gap = self.px(theme.GAP)
@@ -503,6 +516,18 @@ class PropertyPanel(Widget):
         if kind == 'idblock':
             self._draw_idblock(row, rect, active)
             return
+        if kind == 'chips':
+            self._draw_chips(row, rect, active)
+            return
+        if kind == 'vector':
+            self._draw_label(self._columns(rect)[0], row.get("label", ""), active)
+            for field, spot in zip(row.get("fields") or (),
+                                   self._vector_rects(row, rect)):
+                self._draw_number(field, spot, active)
+            _field, suffix_rects = self._suffix_rects(row, self._columns(rect)[1])
+            for spec, spot in zip(row.get("suffix") or (), suffix_rects):
+                self._draw_suffix(spec, spot, active)
+            return
 
         label_rect, value_rect = self._columns(rect)
         # A checkbox carries its own caption. Blender does the same: under
@@ -614,6 +639,83 @@ class PropertyPanel(Widget):
                 _dim(colour, active),
             )
 
+    def _vector_rects(self, row, rect):
+        """The value column cut into one field per component, with a gap."""
+        fields = row.get("fields") or ()
+        area, _suffix = self._suffix_rects(row, self._columns(rect)[1])
+        x, y, width, height = area
+        count = max(1, len(fields))
+        gap = self.px(theme.GAP)
+        if row.get("suffix"):
+            width -= gap
+        each = (width - gap * (count - 1)) / count
+        return [
+            (int(x + index * (each + gap)), y, int(each), height)
+            for index in range(len(fields))
+        ]
+
+    def _press_vector(self, row, rect, event):
+        if not row.get("active", True):
+            return True
+        _area, suffix_rects = self._suffix_rects(row, self._columns(rect)[1])
+        for spec, spot in zip(row.get("suffix") or (), suffix_rects):
+            if _inside(spot, event.mouse_x, event.mouse_y):
+                self._write(spec.get("owner"), spec.get("key"),
+                            not bool(spec.get("value")))
+                return True
+        for field, spot in zip(row.get("fields") or (),
+                               self._vector_rects(row, rect)):
+            if _inside(spot, event.mouse_x, event.mouse_y):
+                self._press_number(field, spot, event)
+                break
+        return True
+
+    def _chip_rects(self, row, rect):
+        chips = row.get("chips") or ()
+        x, y, width, height = rect
+        count = max(1, len(chips))
+        return [
+            (x + int(width * index / count), y,
+             int(width * (index + 1) / count) - int(width * index / count),
+             height)
+            for index in range(len(chips))
+        ]
+
+    def _draw_chips(self, row, rect, active):
+        """Segments that each switch on their own -- unlike `enum_row`, any
+        number of them can be pressed at once."""
+        chips = row.get("chips") or ()
+        size = self.px(theme.FONT_SIZE)
+        count = len(chips)
+        for index, (chip, spot) in enumerate(zip(chips, self._chip_rects(row, rect))):
+            on = bool(chip.get("value"))
+            corners = draw.CORNER_ALL
+            if count > 1:
+                if index == 0:
+                    corners = draw.CORNER_LEFT
+                elif index == count - 1:
+                    corners = draw.CORNER_RIGHT
+                else:
+                    corners = draw.CORNER_NONE
+            self._widget_face(
+                spot, self._hovering(spot) and not on, sunken=on, corners=corners
+            )
+            colour = theme.WIDGET_TEXT_SEL if on else theme.WIDGET_TEXT
+            draw.text_centered(
+                spot[0] + spot[2] * 0.5, spot[1] + spot[3] * 0.5,
+                chip.get("label", ""), size, _dim(colour, active),
+            )
+
+    def _press_chips(self, row, rect, event):
+        if not row.get("active", True):
+            return True
+        for chip, spot in zip(row.get("chips") or (), self._chip_rects(row, rect)):
+            if _inside(spot, event.mouse_x, event.mouse_y):
+                self._write(chip.get("owner"), chip.get("key"),
+                            not bool(chip.get("value")))
+                break
+        return True
+
     def _checkbox_rect(self, rect):
         x, y, _width, height = rect
         box = self.px(14)
@@ -676,6 +778,17 @@ class PropertyPanel(Widget):
             x + width * 0.5, y + height * 0.5, self.format_value(row), size,
             _dim(theme.WIDGET_TEXT, active),
         )
+
+        # A field sharing its row with others says which axis it is, faded,
+        # at its left end -- the way Blender's own XYZ columns do.
+        prefix = row.get("prefix")
+        if prefix:
+            _, text_height = draw.text_dimensions(prefix, size)
+            draw.text(
+                x + self.px(theme.PAD), y + (height - text_height) * 0.5,
+                prefix, size, _dim(theme.WIDGET_TEXT_DIM, active),
+            )
+            return
 
         # Blender puts step arrows on a number field under the pointer. They
         # are the only way to nudge a value by exactly one step.
@@ -801,6 +914,8 @@ class PropertyPanel(Widget):
 
     def _draw_idblock(self, row, rect, active):
         """Blender's `template_ID`, in our metrics: pick one, make one, drop one."""
+        if row.get("label"):
+            self._draw_label(self._columns(rect)[0], row["label"], active)
         field, button_rects, unlink_rect = self._idblock_rects(row, rect)
         buttons = row.get("buttons") or ()
         name = row.get("value") or ""
@@ -1046,6 +1161,10 @@ class PropertyPanel(Widget):
             return self._press_curve(row, rect, event)
         if kind == 'idblock':
             return self._press_idblock(row, rect, event)
+        if kind == 'chips':
+            return self._press_chips(row, rect, event)
+        if kind == 'vector':
+            return self._press_vector(row, rect, event)
 
         _label_rect, value_rect = self._columns(rect)
         field, suffix_rects = self._suffix_rects(row, value_rect)
@@ -1178,7 +1297,9 @@ class PropertyPanel(Widget):
         step = float(row.get("step", 1.0) or 1.0)
         zone = self.px(self.ARROW_ZONE)
 
-        if not row.get("slider") and width > zone * 3:
+        # A narrow field beside its siblings has its axis letter where the
+        # left arrow would be: no arrows, drag or type.
+        if not row.get("slider") and not row.get("prefix") and width > zone * 3:
             if event.mouse_x < x + zone:
                 self._write(row.get("owner"), key,
                             self._clamp(row, float(row.get("value", 0.0)) - step))
@@ -1363,6 +1484,23 @@ class PropertyPanel(Widget):
                 for spec, spot in zip(row.get("buttons") or (), button_rects):
                     if _inside(spot, mouse_x, mouse_y):
                         return spec.get("desc", "")
+                return row.get("desc", "")
+            if row.get("kind") == 'chips':
+                for chip, spot in zip(row.get("chips") or (),
+                                      self._chip_rects(row, rect)):
+                    if _inside(spot, mouse_x, mouse_y):
+                        return chip.get("desc", "")
+                return row.get("desc", "")
+            if row.get("kind") == 'vector':
+                _area, suffix_rects = self._suffix_rects(
+                    row, self._columns(rect)[1])
+                for spec, spot in zip(row.get("suffix") or (), suffix_rects):
+                    if _inside(spot, mouse_x, mouse_y):
+                        return spec.get("desc", "")
+                for field, spot in zip(row.get("fields") or (),
+                                       self._vector_rects(row, rect)):
+                    if _inside(spot, mouse_x, mouse_y):
+                        return field.get("desc", "")
                 return row.get("desc", "")
 
             _label_rect, value_rect = self._columns(rect)

@@ -108,9 +108,13 @@ class _EmissionDetour:
     regenerating it is both the simplest and the most certain way back.
     """
 
-    def __init__(self, material, channel):
+    def __init__(self, material, channel, encode=False):
         self.material = material
         self.channel = channel
+        # For a file rather than for reading back: Height goes out as
+        # (h + 1) / 2, so a PNG -- which has no negative half -- holds a dent
+        #. Measured exact through a 16-bit PNG.
+        self.encode = encode
         self.nodes = []
 
     def __enter__(self):
@@ -131,6 +135,17 @@ class _EmissionDetour:
         emission.location = (-120.0, 320.0)
         self.nodes.append(emission)
 
+        if self.encode and doc.channel_kind(self.channel) == 'SIGNED':
+            shift = tree.nodes.new('ShaderNodeMath')
+            shift.operation = 'MULTIPLY_ADD'
+            shift.name = "PaintR2 Bake Encode"
+            shift.location = (-300.0, 320.0)
+            shift.inputs[1].default_value = 0.5
+            shift.inputs[2].default_value = 0.5
+            tree.links.new(source, shift.inputs[0])
+            self.nodes.append(shift)
+            source = shift.outputs[0]
+
         tree.links.new(source, emission.inputs["Color"])
         tree.links.new(emission.outputs["Emission"], output.inputs["Surface"])
         return self
@@ -147,6 +162,63 @@ class _EmissionDetour:
             self.material, nodegen.ensure_group(self.material)
         )
         return False
+
+
+class _NormalDetour(_EmissionDetour):
+    """The surface's own normal, for an exported normal map.
+
+    An exported normal carries the height in it, and Cycles'
+    tangent normal bake already reads Normal Map + Bump the way the viewport
+    does (measured) -- so the export bakes the *surface* rather than the
+    stack's Normal output. Built here rather than borrowed from the material,
+    because Unlit and Mesh Map wire no surface detail at all, and an export
+    must not depend on how the material is being looked at.
+    """
+
+    def __enter__(self):
+        tree = self.material.node_tree
+        group_node = tree.nodes.get(nodegen._OWNED["group"])
+        output = nodegen._surface_output(tree)
+        if group_node is None or output is None:
+            raise RuntimeError("this material has no PaintR2 stack in it")
+
+        surface = tree.nodes.new('ShaderNodeBsdfDiffuse')
+        normal_map = tree.nodes.new('ShaderNodeNormalMap')
+        normal_map.space = 'TANGENT'
+        bump = tree.nodes.new('ShaderNodeBump')
+        bump.inputs["Distance"].default_value = nodegen.HEIGHT_DISTANCE
+        for node, y in ((surface, 320.0), (normal_map, 160.0), (bump, 0.0)):
+            node.name = "PaintR2 Bake Normal"
+            node.location = (-120.0, y + 320.0)
+            self.nodes.append(node)
+
+        tree.links.new(group_node.outputs["Normal"], normal_map.inputs["Color"])
+        tree.links.new(group_node.outputs["Height"], bump.inputs["Height"])
+        tree.links.new(normal_map.outputs["Normal"], bump.inputs["Normal"])
+        tree.links.new(bump.outputs["Normal"], surface.inputs["Normal"])
+        tree.links.new(surface.outputs["BSDF"], output.inputs["Surface"])
+        return self
+
+
+def _bake_call(bake_type, **extra):
+    """`object.bake` with a normal bake's axes written out: the scene's own
+    settings are the user's, and a swizzle left there by hand is not what an
+    exported map should be made with."""
+    if bake_type == 'NORMAL':
+        extra.update(normal_space='TANGENT', normal_r='POS_X',
+                     normal_g='POS_Y', normal_b='POS_Z')
+    bpy.ops.object.bake(type=bake_type, **extra)
+
+
+def _flip_green(image):
+    """OpenGL to DirectX: the only difference is which way green points."""
+    import numpy as np
+
+    pixels = np.empty(len(image.pixels), dtype=np.float32)
+    image.pixels.foreach_get(pixels)
+    pixels[1::4] = 1.0 - pixels[1::4]
+    image.pixels.foreach_set(pixels)
+    image.update()
 
 
 # --- temporary bake targets -------------------------------------------------
@@ -270,7 +342,8 @@ def _wants_float(channel, forced=False):
 
 
 def bake_channels(obj, channels, size, margin=16, float_buffer=False,
-                  on_channel=None, settings=None):
+                  on_channel=None, settings=None, encode=False,
+                  normal_format='OPENGL'):
     """Bake several channels, one after another. Returns {channel: BakeResult}.
 
     One bake per channel is the only way there is: Cycles has no bake type
@@ -303,7 +376,8 @@ def bake_channels(obj, channels, size, margin=16, float_buffer=False,
                 on_channel(channel, index)
             out[channel] = bake_object(
                 obj, size, margin=margin, float_buffer=float_buffer,
-                channel=channel, settings=current,
+                channel=channel, settings=current, encode=encode,
+                normal_format=normal_format,
             )
             if out[channel].error is not None:
                 # One channel failing means the material is in a state the next
@@ -758,7 +832,7 @@ def _bake_joined(context, objects, materials, channel):
 
 
 def bake_object(obj, size, margin=16, float_buffer=False, channel='BASE_COLOR',
-                settings=None):
+                settings=None, encode=False, normal_format='OPENGL'):
     """Bake one channel of every PaintR2 material on `obj` into its own image.
 
     `obj` may also be a list of models. **Models that share a material share
@@ -776,6 +850,11 @@ def bake_object(obj, size, margin=16, float_buffer=False, channel='BASE_COLOR',
     holding. Given one, this does not push or pop the scene's bake settings at
     all -- the caller owns them for the whole run. Left out, one bake manages
     its own, which is what a single call has always done.
+
+    `encode` is the export's question rather than a reader's: Height comes
+    out as (h + 1) / 2, and Normal as the surface's normal with the height in
+    it, green flipped for `normal_format` DIRECTX. Without it a
+    channel is baked as the stack computes it -- what the tests read back.
     """
     result = BakeResult()
     objects = list(obj) if isinstance(obj, (list, tuple)) else [obj]
@@ -824,6 +903,11 @@ def bake_object(obj, size, margin=16, float_buffer=False, channel='BASE_COLOR',
     for material in materials:
         nodegen.compile_material(material)
 
+    from . import document as doc
+
+    surface_normal = encode and doc.channel_kind(channel) == 'NORMAL'
+    bake_type = 'NORMAL' if surface_normal else 'EMIT'
+
     targets = []
     detours = []
     for material in materials:
@@ -833,7 +917,10 @@ def bake_object(obj, size, margin=16, float_buffer=False, channel='BASE_COLOR',
             colorspace=doc_colorspace(channel),
         )
         targets.append((material, image, _add_bake_target(material, image)))
-        detours.append(_EmissionDetour(material, channel))
+        detours.append(
+            _NormalDetour(material, channel) if surface_normal
+            else _EmissionDetour(material, channel, encode)
+        )
 
     owns_settings = settings is None
     previous = _push_bake_settings(scene, margin) if owns_settings else settings
@@ -855,8 +942,11 @@ def bake_object(obj, size, margin=16, float_buffer=False, channel='BASE_COLOR',
 
         if len(objects) == 1:
             select_only(context, objects[0])
-            bpy.ops.object.bake(type='EMIT')
-        elif _bake_joined(context, objects, materials, channel):
+            _bake_call(bake_type)
+        elif not surface_normal and _bake_joined(
+                context, objects, materials, channel):
+            # A surface normal is not joined: its tangents belong to each
+            # model's own shading, which a throwaway mesh would recompute.
             pass
         else:
             # A channel that reads more than UVs, so the models cannot be
@@ -872,7 +962,7 @@ def bake_object(obj, size, margin=16, float_buffer=False, channel='BASE_COLOR',
             select_only(context, objects[0])
             for model in objects[1:]:
                 model.select_set(True)
-            bpy.ops.object.bake(type='EMIT', margin=0)
+            _bake_call(bake_type, margin=0)
 
         # Everything past the margin is still black with no alpha, and an
         # exported texture carries that black into whatever renders it: the
@@ -881,6 +971,8 @@ def bake_object(obj, size, margin=16, float_buffer=False, channel='BASE_COLOR',
         # not a polish step -- see dilate.py.
         for _material, image, _node in targets:
             dilate.fill(image)
+            if surface_normal and normal_format == 'DIRECTX':
+                _flip_green(image)
 
         result.images = [(material, image) for material, image, _ in targets]
     except Exception as error:  # noqa: BLE001

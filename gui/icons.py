@@ -791,6 +791,39 @@ def cube(x, y, size, color):
 
 
 @_icon
+def link(x, y, size, color):
+    """Two chain links -- "these values move together"."""
+    point, unit = _grid(x, y, size)
+
+    _stroke([point(2.4, 7.2), point(5.4, 10.2), point(7.4, 10.2),
+             point(8.6, 9.0), point(8.6, 7.4), point(7.6, 6.4)],
+            color, unit)
+    _stroke([point(13.6, 8.8), point(10.6, 5.8), point(8.6, 5.8),
+             point(7.4, 7.0), point(7.4, 8.6), point(8.4, 9.6)],
+            color, unit)
+    _stroke([point(2.4, 7.2), point(3.6, 6.0), point(5.0, 6.0)], color, unit)
+    _stroke([point(13.6, 8.8), point(12.4, 10.0), point(11.0, 10.0)],
+            color, unit)
+
+
+@_icon
+def image(x, y, size, color):
+    """A picture: a frame, a hill and a sun -- "load an image into this".
+
+    The frame is the shape; the hill is what says picture rather than box,
+    and it is one stroke so it survives at 16px.
+    """
+    point, unit = _grid(x, y, size)
+
+    _stroke([point(2.0, 3.0), point(14.0, 3.0), point(14.0, 13.0),
+             point(2.0, 13.0)], color, unit, closed=True)
+    _stroke([point(2.6, 4.0), point(6.4, 8.6), point(9.0, 6.0),
+             point(13.4, 10.2)], color, unit)
+    _stroke([point(10.6, 10.6), point(11.6, 10.6), point(11.6, 11.6),
+             point(10.6, 11.6)], color, unit, closed=True)
+
+
+@_icon
 def folder(x, y, size, color):
     """A folder -- a group of layers.
 

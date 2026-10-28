@@ -553,6 +553,10 @@ class Dropdown(Widget):
         # The open list may be wider than the closed one. A dropdown squeezed
         # into a layer row is too narrow to read "Linear Light" in.
         self.popup_width = None
+        # Identifiers drawn faded in the open list: still choosable, but
+        # saying "nothing uses this yet" -- the channel picker's inactive
+        # channels.
+        self.dimmed = set()
 
     def label_for(self, value):
         for identifier, label in self.items:
@@ -658,12 +662,15 @@ class Dropdown(Widget):
                                   row_radius, theme.LIST_HOVER)
 
             _, text_height = draw.text_dimensions(label, size)
+            colour = theme.MENU_TEXT
+            if identifier in self.dimmed:
+                colour = tuple(colour[:3]) + (colour[3] * 0.45,)
             draw.text_elided(
                 x + pad,
                 row_y + (row - text_height) * 0.5,
                 label,
                 size,
-                theme.MENU_TEXT,
+                colour,
                 width - pad * 2,
             )
 
