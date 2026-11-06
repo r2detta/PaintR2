@@ -29,7 +29,9 @@ jobs:
             os: windows-latest
             exe: paintr2_bake.exe
           - platform: macos-arm64
-            os: macos-14
+            # macos-14 runners are gone ("configuration not supported"); the
+            # deployment target below keeps the binary running on macOS 14.
+            os: macos-latest
             exe: paintr2_bake
           # In a manylinux_2_28 container, so the binary needs only glibc
           # 2.28 and runs on every distribution Blender 5.2 itself runs on.
@@ -76,7 +78,8 @@ jobs:
       - name: Build
         run: |
           cmake -S PaintR2Bake -B build -DCMAKE_BUILD_TYPE=Release \
-              ${OPENCL_PREFIX:+-DCMAKE_PREFIX_PATH="$OPENCL_PREFIX"}
+              ${OPENCL_PREFIX:+-DCMAKE_PREFIX_PATH="$OPENCL_PREFIX"} \
+              ${{ matrix.platform == 'macos-arm64' && '-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0' || '' }}
           cmake --build build --config Release
           mkdir -p out
           if [ -f build/Release/${{ matrix.exe }} ]; then
