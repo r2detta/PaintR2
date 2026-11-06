@@ -125,7 +125,8 @@ class PAINTR2_OT_layer_add(bpy.types.Operator):
 
         if self.layer_type == 'PAINT':
             props = context.scene.paintr2
-            image, _ = prepare.ensure_image(
+            image, _ = prepare.image_for(
+                material,
                 prepare.unique_image_name(f"{material.name}_{layer.name}"),
                 int(props.image_resolution),
                 # A fresh paint layer starts fully transparent so the layers
@@ -385,7 +386,8 @@ class PAINTR2_OT_effect_add(bpy.types.Operator):
             # the alpha is what it blends by. Non-Color on a mask for the same
             # reason the mask image itself is: a mask is data, and 0.5 written
             # into an sRGB image reads back as 0.74.
-            image, _made = prepare.ensure_image(
+            image, _made = prepare.image_for(
+                material,
                 prepare.unique_image_name(
                     f"{material.name}_{layer.name}"
                     f"_{'mask' if on_mask else 'color'}_paint"

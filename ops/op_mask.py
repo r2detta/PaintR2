@@ -70,7 +70,8 @@ class PAINTR2_OT_mask_add(bpy.types.Operator):
         # A mask is data, not colour, and the space has to be set as the
         # image is made rather than after: the flood colour is written through
         # whatever the image says it is at the time.
-        image, _ = prepare.ensure_image(
+        image, _ = prepare.image_for(
+            material,
             prepare.unique_image_name(f"{material.name}_{layer.name}_mask"),
             int(props.image_resolution),
             (value, value, value, 1.0),
@@ -218,7 +219,9 @@ class PAINTR2_OT_mask_procedural_bake(bpy.types.Operator):
 
     bl_idname = "paintr2.mask_procedural_bake"
     bl_label = "Bake Procedural Mask"
-    bl_options = {'REGISTER', 'UNDO'}
+    # The step is history.py's: it carries the baked pixels, and the hidden
+    # memfile step before it carries the switches this flips.
+    bl_options = {'REGISTER'}
 
     @classmethod
     def poll(cls, context):
@@ -226,7 +229,9 @@ class PAINTR2_OT_mask_procedural_bake(bpy.types.Operator):
         return layer is not None and layer.mask_procedural.enabled
 
     def execute(self, context):
-        from .. import bake
+        import numpy
+
+        from .. import bake, history, udim
 
         material, layer = _active_layer(context)
         if layer is None:
@@ -237,10 +242,27 @@ class PAINTR2_OT_mask_procedural_bake(bpy.types.Operator):
             self.report({'ERROR'}, "Select the model this material is on")
             return {'CANCELLED'}
 
+        existing = layer.mask_image
+        before = history.capture(existing) if existing is not None else None
+
         result = bake.bake_mask(obj, material, layer)
         if result.error is not None:
+            # The bake clears the image before it runs; a failed one must
+            # not leave the mask blank.
+            for tile, _bbox, pixels in before or ():
+                udim.write(existing, tile, pixels)
             self.report({'ERROR'}, str(result.error))
             return {'CANCELLED'}
+
+        image = layer.mask_image
+        if before is None:
+            # A mask made by the bake: before it there was its own white.
+            before = []
+            for tile in udim.tiles_of(image):
+                width, height = udim.tile_size(image, tile)
+                before.append((tile, (0, 0, width, height),
+                               numpy.ones((height, width, 4), numpy.float32)))
+        history.record(image, before)
 
         # Painting is the reason to bake it, so the brush is pointed at it.
         material.paintr2.set_active_part('MASK')
@@ -296,7 +318,9 @@ class PAINTR2_OT_mask_invert(bpy.types.Operator):
 
     bl_idname = "paintr2.mask_invert"
     bl_label = "Invert Mask"
-    bl_options = {'REGISTER', 'UNDO'}
+    # No 'UNDO': history.py makes the step, and a memfile step on top of it
+    # would be a second Ctrl+Z that changes nothing.
+    bl_options = {'REGISTER'}
 
     @classmethod
     def poll(cls, context):
@@ -313,19 +337,26 @@ class PAINTR2_OT_mask_invert(bpy.types.Operator):
         # and `list(image.pixels)` alone takes seconds.
         import numpy
 
-        width, height = image.size
-        pixels = numpy.empty(width * height * image.channels, dtype=numpy.float32)
-        image.pixels.foreach_get(pixels)
+        from .. import history, udim
 
-        channels = pixels.reshape(-1, image.channels)
-        channels[:, :3] = 1.0 - channels[:, :3]   # alpha is left alone
+        before = history.capture(image)
+        for tile in udim.tiles_of(image):
+            width, height = udim.tile_size(image, tile)
+            pixels = numpy.empty(width * height * image.channels, dtype=numpy.float32)
+            with udim.on_tile(image, tile) as target:
+                target.pixels.foreach_get(pixels)
 
-        image.pixels.foreach_set(pixels)
-        # foreach_set writes the buffer without telling Blender the image
-        # changed, so both of these are needed: one to refresh what is drawn,
-        # one so storage.py knows there is work worth saving.
-        image.update()
+            channels = pixels.reshape(-1, image.channels)
+            channels[:, :3] = 1.0 - channels[:, :3]   # alpha is left alone
+
+            with udim.on_tile(image, tile) as target:
+                target.pixels.foreach_set(pixels)
+                # foreach_set writes the buffer without telling Blender the image
+                # changed, so both of these are needed: one to refresh what is
+                # drawn, one so storage.py knows there is work worth saving.
+                target.update()
         image.update_tag()
+        history.record(image, before)
 
         self.report({'INFO'}, f"Inverted the mask on {layer.name}")
         return {'FINISHED'}
@@ -419,7 +450,7 @@ class PAINTR2_OT_mask_export(bpy.types.Operator, ExportHelper):
                 and not len(layer.mask_effects))
 
     def _copy_of(self, image):
-        """A throwaway image carrying `image`'s pixels.
+        """A throwaway image carrying `image`'s pixels, tile by tile if UDIM.
 
         **Not `image.copy()`.** Measured: copying a `GENERATED` image
         re-generates it from `generated_color` instead of duplicating the
@@ -428,6 +459,18 @@ class PAINTR2_OT_mask_export(bpy.types.Operator, ExportHelper):
         mask export looked like. Assigning `pixels` across is what actually
         carries the painting.
         """
+        from .. import udim
+
+        if udim.is_tiled(image):
+            # `copy()` is right about the tiles and their sizes and wrong about
+            # the pixels, the same way it is for a plain image; so the tiles
+            # come from it and the pixels are carried across one tile at a time.
+            made = image.copy()
+            made.name = f"{image.name}_export"
+            for tile in udim.tiles_of(image):
+                udim.write(made, tile, udim.read(image, tile))
+            return made
+
         made = bpy.data.images.new(
             f"{image.name}_export", image.size[0], image.size[1],
             alpha=True, float_buffer=image.is_float,
@@ -473,6 +516,14 @@ class PAINTR2_OT_mask_export(bpy.types.Operator, ExportHelper):
                 return {'CANCELLED'}
             image = result.images[0][1]
             note = "baked mask"
+
+        from .. import udim
+
+        if udim.is_tiled(image):
+            # One file per tile: `Body_Paint_mask.1001.png` beside the name
+            # that was picked, never instead of it.
+            stem, extension = os.path.splitext(path)
+            path = f"{stem}.<UDIM>{extension}"
 
         try:
             image.filepath_raw = path

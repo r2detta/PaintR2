@@ -34,8 +34,9 @@ cost of that is known: a memfile undo step does not contain those
 bytes, so the undo stack and the image stop agreeing about what happened. The
 user's Ctrl+Z went to the beginning of the session.
 
-So it goes through `history.py`, the ring the fill tools keep for exactly this
-reason. One press of the button is one step of PaintR2's own undo.
+So it goes through `history.py`, which makes it one step of Blender's own
+undo, in order with the strokes around it. One press of the button is
+one Ctrl+Z.
 """
 
 import numpy
@@ -61,21 +62,40 @@ def clean(image, agreement=AGREEMENT, disagreement=DISAGREEMENT, record=True):
     a deliberately thin mark are all left alone. What is left over is a speck,
     and it is replaced by what its neighbours say it should have been.
 
-    `record` puts the image back on PaintR2's own undo ring before writing.
-    Blender's undo cannot carry a direct pixel write, so this is the
-    only Ctrl+Z that will bring the specks back -- and the specks are why
-    somebody might want to.
+    `record` makes the clean-up an undo step (history.py): Blender's undo
+    does not see a direct pixel write by itself, and the specks are exactly
+    what somebody might want back.
 
     Reads and writes the whole image in one pass each; `image.pixels` is a
     round trip through Blender either way and slicing it would be slower, not
-    faster.
+    faster. A UDIM image is one pass per tile and still one undo step.
     """
-    width, height = image.size
-    if width < 3 or height < 3:
-        return 0
+    from . import history, udim
 
-    pixels = numpy.empty(len(image.pixels), dtype=numpy.float32)
-    image.pixels.foreach_get(pixels)
+    total = 0
+    parts = []
+    for tile in udim.tiles_of(image):
+        fixed, part = _clean_tile(image, tile, agreement, disagreement, record)
+        total += fixed
+        if part is not None:
+            parts.append(part)
+
+    if parts:
+        history.push_parts(image, parts)
+    return total
+
+
+def _clean_tile(image, tile, agreement, disagreement, record):
+    """Clean one tile. Returns (texels replaced, undo part or None)."""
+    from . import udim
+
+    width, height = udim.tile_size(image, tile)
+    if width < 3 or height < 3:
+        return 0, None
+
+    pixels = numpy.empty(width * height * 4, dtype=numpy.float32)
+    with udim.on_tile(image, tile) as target:
+        target.pixels.foreach_get(pixels)
     rgba = pixels.reshape(height, width, 4)
 
     # One channel decides. A dropped texel is dropped in all of them -- it
@@ -93,22 +113,21 @@ def clean(image, agreement=AGREEMENT, disagreement=DISAGREEMENT, record=True):
     rows, columns = numpy.nonzero(speck)
     count = int(rows.size)
     if count == 0:
-        return 0
+        return 0, None
 
     # Back to the whole image's coordinates: the comparison ran on the inside.
     rows = rows + 1
     columns = columns + 1
 
+    part = None
     if record:
         # The rectangle the specks sit in, as it was. A step is a rectangle
         # rather than the whole image for the reason history.py gives: a 4K
         # snapshot per step is 268 MB.
-        from . import history
-
         top, bottom = int(rows.min()), int(rows.max()) + 1
         first, last = int(columns.min()), int(columns.max()) + 1
-        history.push(image, (first, top, last, bottom),
-                     rgba[top:bottom, first:last].copy())
+        part = (tile, (first, top, last, bottom),
+                rgba[top:bottom, first:last].copy())
 
     for index in range(4):
         plane = rgba[:, :, index]
@@ -117,19 +136,30 @@ def clean(image, agreement=AGREEMENT, disagreement=DISAGREEMENT, record=True):
             + plane[rows, columns + 1] + plane[rows, columns - 1]
         )
 
-    image.pixels.foreach_set(pixels)
-    image.update()
-    return count
+    with udim.on_tile(image, tile) as target:
+        target.pixels.foreach_set(pixels)
+        target.update()
+    return count, part
 
 
 def count(image, agreement=AGREEMENT, disagreement=DISAGREEMENT):
     """How many specks `image` holds, without touching it."""
-    width, height = image.size
+    from . import udim
+
+    return sum(_count_tile(image, tile, agreement, disagreement)
+               for tile in udim.tiles_of(image))
+
+
+def _count_tile(image, tile, agreement, disagreement):
+    from . import udim
+
+    width, height = udim.tile_size(image, tile)
     if width < 3 or height < 3:
         return 0
 
-    pixels = numpy.empty(len(image.pixels), dtype=numpy.float32)
-    image.pixels.foreach_get(pixels)
+    pixels = numpy.empty(width * height * 4, dtype=numpy.float32)
+    with udim.on_tile(image, tile) as target:
+        target.pixels.foreach_get(pixels)
     channel = pixels.reshape(height, width, 4)[:, :, 0]
 
     up, down = channel[2:, 1:-1], channel[:-2, 1:-1]

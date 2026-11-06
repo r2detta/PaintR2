@@ -36,8 +36,10 @@ def external_directory():
     return os.path.splitext(blend_path)[0] + FOLDER_SUFFIX
 
 
-def layer_images():
+def layer_images(material=None):
     """Every image a PaintR2 layer refers to, without duplicates.
+
+    `material` narrows it to that material's layers.
 
     Masks included. They were not, and that was a hole: a mask created after
     the .blend was first saved got written once by `adopt_new_image` and then
@@ -47,7 +49,7 @@ def layer_images():
     seen = set()
     images = []
 
-    for material in bpy.data.materials:
+    for material in (bpy.data.materials if material is None else (material,)):
         document = getattr(material, "paintr2", None)
         if document is None:
             continue
@@ -76,8 +78,13 @@ def needs_saving(image):
         return False
     if image.is_dirty:
         return True
-    # Never written anywhere: even unpainted, it only exists in memory.
-    return image.source == 'GENERATED' and not image.filepath_raw
+    # Never written anywhere: even unpainted, it only exists in memory. A UDIM
+    # image never reads GENERATED, it says TILED from the start.
+    if image.source in {'GENERATED', 'TILED'} and not image.filepath_raw:
+        return True
+    # A tile added to a UDIM image since it was written is in memory only, and
+    # adding one does not make the image dirty (measured).
+    return image.source == 'TILED' and any(t.is_generated_tile for t in image.tiles)
 
 
 def unsaved_images():
@@ -87,11 +94,17 @@ def unsaved_images():
 # --- writing ----------------------------------------------------------------
 
 
+def _file_name(image):
+    """`Body_Base.png`, or `Body_Base.<UDIM>.png`: Blender expands that per tile."""
+    tile = ".<UDIM>" if image.source == 'TILED' else ""
+    return bpy.path.clean_name(image.name) + tile + EXTENSION
+
+
 def save_image(image, directory):
     """Write `image` into `directory` as PNG. Returns the path."""
     os.makedirs(directory, exist_ok=True)
 
-    path = os.path.join(directory, bpy.path.clean_name(image.name) + EXTENSION)
+    path = os.path.join(directory, _file_name(image))
 
     image.filepath_raw = path
     image.file_format = FILE_FORMAT
@@ -141,10 +154,11 @@ def _pack_via_temp(image):
     is exactly when someone reaches for it: with no folder beside the file,
     packing is the *only* place the pixels can go.
     """
+    import shutil
     import tempfile
 
     folder = tempfile.mkdtemp(prefix="paintr2_pack_")
-    path = os.path.join(folder, f"{bpy.path.clean_name(image.name)}.png")
+    path = os.path.join(folder, _file_name(image))
     previous_format = image.file_format
     previous_path = image.filepath_raw
 
@@ -159,13 +173,55 @@ def _pack_via_temp(image):
             image.file_format = previous_format
         except (RuntimeError, TypeError):
             pass
-        try:
-            os.remove(path)
-            os.rmdir(folder)
-        except OSError:
-            pass
+        # A UDIM image left one file per tile behind it.
+        shutil.rmtree(folder, ignore_errors=True)
 
     return image.packed_file is not None
+
+
+def repack(image):
+    """Pack `image` again, every tile, from what is in memory. True when it worked.
+
+    For a UDIM image that was packed and has just been given a tile. Measured,
+    two ways it goes wrong otherwise: a pack-only image keeps its old pack and
+    `pack()` adds nothing to it, so the new tile is never packed; a packed
+    image that also has a file is unpacked by the new tile instead. So: every
+    tile is written to a throwaway folder from memory, the old pack is
+    dropped, and the image is packed from those files.
+
+    The folder is only removed once the pack has worked. If it has not, the
+    image still points at it and the pixels are there to be saved.
+    """
+    import shutil
+    import tempfile
+
+    from . import udim
+
+    for tile in udim.tiles_of(image):
+        udim.read(image, tile)  # in memory before the old pack is dropped
+
+    folder = tempfile.mkdtemp(prefix="paintr2_pack_")
+    previous_format = image.file_format
+    try:
+        image.file_format = 'PNG'
+        image.filepath_raw = os.path.join(folder, _file_name(image))
+        image.save()
+        if image.packed_file is not None:
+            image.unpack(method='REMOVE')
+        image.pack()
+    finally:
+        packed = image.packed_file is not None
+        try:
+            image.file_format = previous_format
+        except (RuntimeError, TypeError):
+            pass
+        if packed:
+            image.filepath_raw = ""
+            shutil.rmtree(folder, ignore_errors=True)
+        else:
+            print(f"[PaintR2] {image.name} could not be packed again; its "
+                  f"tiles are in {folder} until the .blend is saved")
+    return packed
 
 
 def pack_all():

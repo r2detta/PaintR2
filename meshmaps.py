@@ -33,6 +33,11 @@ A cage-less high-poly bake stands on two numbers, `cage_extrusion` and
 `max_ray_distance`, and there is no value that is right for every model.
 `measure_cage` measures the two surfaces instead of guessing at them.
 
+On a UDIM material every map is a UDIM image with the material's tiles.
+Cycles bakes into all of them in one call; everything numpy does afterwards --
+blanking, filling, Position's remap, Height's arithmetic, laying several
+models into one map -- runs tile by tile through `udim.read` / `udim.write`.
+
 Every finished map is filled out past its UV islands before it is handed
 back -- see `dilate.py`. Blender's bake margin stops after its own handful of
 pixels and everything beyond it is left black, which is the black that bleeds
@@ -70,6 +75,7 @@ import numpy as np
 
 from . import dilate
 from . import storage
+from . import udim
 
 
 MAPS = (
@@ -719,13 +725,29 @@ def _restore_output(material):
 # --- bake plumbing -----------------------------------------------------------
 
 
-def _ensure_image(name, size, colorspace, float_buffer=False):
+def _ensure_image(name, size, colorspace, float_buffer=False, tiles=None):
+    """The map image called `name`, made fresh unless it already fits.
+
+    `tiles` makes it a UDIM image, `size` each. One of the wrong shape -- a
+    plain map left from before, a tile set the UVs have since outgrown -- is
+    replaced rather than baked into.
+    """
     existing = bpy.data.images.get(name)
     if existing is not None:
-        if tuple(existing.size) == (size, size) and existing.is_float == float_buffer:
+        if tiles:
+            fits = udim.same_tiles(existing, tiles, size, float_buffer)
+        else:
+            fits = (not udim.is_tiled(existing)
+                    and tuple(existing.size) == (size, size)
+                    and existing.is_float == float_buffer)
+        if fits:
             existing.colorspace_settings.name = colorspace
             return existing
         bpy.data.images.remove(existing)
+
+    if tiles:
+        return udim.new_image(name, size, (0.0, 0.0, 0.0, 0.0), tiles,
+                              colorspace, float_buffer=float_buffer)
 
     image = bpy.data.images.new(
         name, width=size, height=size, alpha=True, float_buffer=float_buffer
@@ -993,6 +1015,8 @@ def _bake_into(obj, image, bake_type, margin, ao_distance=None, attribute=None,
                     "available in this Blender build"
                 )
             extra.setdefault("margin_type", options.margin_type)
+            if udim.is_tiled(image):
+                extra["margin_type"] = udim.BAKE_MARGIN_TYPE
             if bake_type == 'EMIT':
                 with _DataShading(shaded, attribute):
                     bpy.ops.object.bake(type='EMIT', **extra)
@@ -1110,15 +1134,13 @@ def _bake_position(obj, image, margin, high=None, options=None):
     lo, hi = world_bounds(high if high is not None else obj)
     span = [max(hi[i] - lo[i], 1e-6) for i in range(3)]
 
-    pixels = np.empty(len(image.pixels), dtype=np.float32)
-    image.pixels.foreach_get(pixels)
-    pixels = pixels.reshape(-1, 4)
-    for channel in range(3):
-        pixels[:, channel] = np.clip(
-            (pixels[:, channel] - lo[channel]) / span[channel], 0.0, 1.0
-        )
-    image.pixels.foreach_set(pixels.reshape(-1))
-    image.update()
+    for tile in udim.tiles_of(image):
+        pixels = udim.read(image, tile)
+        for channel in range(3):
+            pixels[..., channel] = np.clip(
+                (pixels[..., channel] - lo[channel]) / span[channel], 0.0, 1.0
+            )
+        udim.write(image, tile, pixels)
 
 
 def _bake_thickness(obj, image, margin, reach, high=None, options=None):
@@ -1234,15 +1256,20 @@ def _bake_height(obj, image, margin, high, options):
     origin would have half its height computed from a flat 0.
     """
     size = image.size[0]
+    # The scratch bakes take the shape of the map they feed, tiles and all.
+    tiles = udim.tiles_of(image) if udim.is_tiled(image) else None
 
     high_pos = _ensure_image(
-        f"{map_name(obj, 'HEIGHT')}_src_high", size, 'Non-Color', float_buffer=True
+        f"{map_name(obj, 'HEIGHT')}_src_high", size, 'Non-Color',
+        float_buffer=True, tiles=tiles,
     )
     low_pos = _ensure_image(
-        f"{map_name(obj, 'HEIGHT')}_src_low", size, 'Non-Color', float_buffer=True
+        f"{map_name(obj, 'HEIGHT')}_src_low", size, 'Non-Color',
+        float_buffer=True, tiles=tiles,
     )
     low_nrm = _ensure_image(
-        f"{map_name(obj, 'HEIGHT')}_src_normal", size, 'Non-Color', float_buffer=True
+        f"{map_name(obj, 'HEIGHT')}_src_normal", size, 'Non-Color',
+        float_buffer=True, tiles=tiles,
     )
 
     try:
@@ -1251,61 +1278,64 @@ def _bake_height(obj, image, margin, high, options):
         _bake_into(obj, low_nrm, 'NORMAL', margin, options=options,
                    normal_space='OBJECT')
 
-        high_px = _read(high_pos)
-        low_px = _read(low_pos)
-        nrm_px = _read(low_nrm)
-
-        # An object-space normal bake writes (n + 1) / 2, and it writes the
-        # object's own space -- so it has to come back to world before it can
-        # be dotted with a difference of world positions.
-        normals = nrm_px[:, :3] * 2.0 - 1.0
         matrix = np.array(
             obj.matrix_world.to_3x3().inverted_safe().transposed(),
             dtype=np.float32,
         )
-        normals = normals @ matrix.T
-        length = np.linalg.norm(normals, axis=1, keepdims=True)
-        normals = np.divide(normals, np.maximum(length, 1e-9))
-
-        offset = high_px[:, :3] - low_px[:, :3]
-        height = np.sum(offset * normals, axis=1)
-
-        # Where no ray found the high-poly, the bake wrote (0, 0, 0, 0) and
-        # the difference is a distance to the origin rather than to anything.
-        # Measured: alpha comes back exactly 0 there and exactly 1 elsewhere,
-        # so it is the mask, not a guess at one. Note this is the bake writing
-        # the zero itself rather than the blank showing through -- it holds
-        # under either clear; see `dilate.blank`.
-        missed = high_px[:, 3] < 0.5
-        height[missed] = 0.0
-
-        out = np.clip(0.5 + height / (2.0 * options.height_range), 0.0, 1.0)
-
-        pixels = np.empty((out.shape[0], 4), dtype=np.float32)
-        pixels[:, 0] = out
-        pixels[:, 1] = out
-        pixels[:, 2] = out
-        # Alpha is the low-poly's own UV coverage, carried over from its
-        # position bake, because this is the one map whose pixels are computed
-        # rather than rendered -- writing a flat 1 here would tell `dilate`
-        # that the empty half of the texture had been baked, and it would
-        # leave it black. The high-poly's coverage is deliberately *not* what
-        # is used: a texel the rays missed is still a texel of the low-poly,
-        # and 0.5 (flat) is the right answer there.
-        pixels[:, 3] = np.where(low_px[:, 3] >= 0.5, 1.0, 0.0)
-        image.pixels.foreach_set(pixels.reshape(-1))
-        image.update()
+        for tile in udim.tiles_of(image):
+            pixels = _height_pixels(
+                _read(high_pos, tile), _read(low_pos, tile), _read(low_nrm, tile),
+                matrix, options,
+            )
+            udim.write(image, tile, pixels)
     finally:
         for scratch in (high_pos, low_pos, low_nrm):
             if scratch.name in bpy.data.images:
                 bpy.data.images.remove(scratch)
 
 
-def _read(image):
-    """An image as an (n, 4) float array."""
-    flat = np.empty(len(image.pixels), dtype=np.float32)
-    image.pixels.foreach_get(flat)
-    return flat.reshape(-1, 4)
+def _height_pixels(high_px, low_px, nrm_px, matrix, options):
+    """One image's (or tile's) worth of height, from the three bakes."""
+    # An object-space normal bake writes (n + 1) / 2, and it writes the
+    # object's own space -- so it has to come back to world before it can
+    # be dotted with a difference of world positions.
+    normals = nrm_px[:, :3] * 2.0 - 1.0
+    normals = normals @ matrix.T
+    length = np.linalg.norm(normals, axis=1, keepdims=True)
+    normals = np.divide(normals, np.maximum(length, 1e-9))
+
+    offset = high_px[:, :3] - low_px[:, :3]
+    height = np.sum(offset * normals, axis=1)
+
+    # Where no ray found the high-poly, the bake wrote (0, 0, 0, 0) and
+    # the difference is a distance to the origin rather than to anything.
+    # Measured: alpha comes back exactly 0 there and exactly 1 elsewhere,
+    # so it is the mask, not a guess at one. Note this is the bake writing
+    # the zero itself rather than the blank showing through -- it holds
+    # under either clear; see `dilate.blank`.
+    missed = high_px[:, 3] < 0.5
+    height[missed] = 0.0
+
+    out = np.clip(0.5 + height / (2.0 * options.height_range), 0.0, 1.0)
+
+    pixels = np.empty((out.shape[0], 4), dtype=np.float32)
+    pixels[:, 0] = out
+    pixels[:, 1] = out
+    pixels[:, 2] = out
+    # Alpha is the low-poly's own UV coverage, carried over from its
+    # position bake, because this is the one map whose pixels are computed
+    # rather than rendered -- writing a flat 1 here would tell `dilate`
+    # that the empty half of the texture had been baked, and it would
+    # leave it black. The high-poly's coverage is deliberately *not* what
+    # is used: a texel the rays missed is still a texel of the low-poly,
+    # and 0.5 (flat) is the right answer there.
+    pixels[:, 3] = np.where(low_px[:, 3] >= 0.5, 1.0, 0.0)
+    return pixels
+
+
+def _read(image, tile=None):
+    """An image, or one of its tiles, as an (n, 4) float array."""
+    return udim.read(image, tile).reshape(-1, 4)
 
 
 # --- public ------------------------------------------------------------------
@@ -1401,7 +1431,8 @@ def bake_material(material, parts, identifiers, size=1024, margin=8, smooth=1,
             continue
 
         image = _ensure_image(
-            map_name(material, identifier), size, entry[2], float_buffer=entry[4]
+            map_name(material, identifier), size, entry[2], float_buffer=entry[4],
+            tiles=udim.tiles_for(material),
         )
 
         merged = None
@@ -1424,16 +1455,20 @@ def bake_material(material, parts, identifiers, size=1024, margin=8, smooth=1,
                     if len(usable) > 1:
                         # Every bake blanks the image first, so each model's
                         # share is lifted out before the next one lands.
-                        baked = _read(image)
-                        merged = baked if merged is None \
-                            else merge_coverage(merged, baked)
+                        baked = {tile: _read(image, tile)
+                                 for tile in udim.tiles_of(image)}
+                        if merged is None:
+                            merged = baked
+                        else:
+                            for tile, pixels in baked.items():
+                                merge_coverage(merged[tile], pixels)
         except Exception as error:  # noqa: BLE001
             result.error = error
             return result
 
         if merged is not None:
-            image.pixels.foreach_set(merged.reshape(-1))
-            image.update()
+            for tile, pixels in merged.items():
+                udim.write(image, tile, pixels)
 
         # Past the margin the bake left black with no alpha, and black is what
         # bleeds back across a seam the moment anything filters the texture.

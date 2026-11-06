@@ -29,6 +29,7 @@ class PAINTR2_PT_sidebar(bpy.types.Panel):
         box = layout.box()
         box.label(text="Prepare", icon='MATERIAL')
         box.prop(props, "image_resolution")
+        box.prop(props, "image_udim")
 
         row = box.row()
         row.scale_y = 1.3

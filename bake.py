@@ -29,6 +29,10 @@ Measured facts on Blender 5.2:
 * A byte image with an sRGB colorspace stores *encoded* values: a linear 0.5
   reads back as ~0.737 through `image.pixels`. That is correct, not a bug --
   the PNG on disk ends up properly sRGB encoded.
+* **A UDIM target takes the whole set in one bake**: Cycles writes each
+  tile at its own size, and leaves a tile no UV reaches untouched. What comes
+  after -- filling, flipping green -- is per tile, and the file is one per tile,
+  `Body_base_color.1001.png` and on.
 """
 
 import contextlib
@@ -40,6 +44,7 @@ import bpy
 from . import dilate
 from . import meshmaps
 from . import nodegen
+from . import udim
 
 
 BAKE_TARGET_NAME = "PaintR2 Bake Target"
@@ -112,8 +117,8 @@ class _EmissionDetour:
         self.material = material
         self.channel = channel
         # For a file rather than for reading back: Height goes out as
-        # (h + 1) / 2, so a PNG -- which has no negative half -- holds a dent
-        #. Measured exact through a 16-bit PNG.
+        # (h + 1) / 2, so a PNG -- which has no negative half -- holds a dent.
+        # Measured exact through a 16-bit PNG.
         self.encode = encode
         self.nodes = []
 
@@ -210,15 +215,27 @@ def _bake_call(bake_type, **extra):
     bpy.ops.object.bake(type=bake_type, **extra)
 
 
+@contextlib.contextmanager
+def _tile_margin(scene, images):
+    """The margin type a UDIM target needs, for the duration (`udim.BAKE_MARGIN_TYPE`)."""
+    bake = scene.render.bake
+    if not any(udim.is_tiled(image) for image in images):
+        yield
+        return
+    previous = bake.margin_type
+    bake.margin_type = udim.BAKE_MARGIN_TYPE
+    try:
+        yield
+    finally:
+        bake.margin_type = previous
+
+
 def _flip_green(image):
     """OpenGL to DirectX: the only difference is which way green points."""
-    import numpy as np
-
-    pixels = np.empty(len(image.pixels), dtype=np.float32)
-    image.pixels.foreach_get(pixels)
-    pixels[1::4] = 1.0 - pixels[1::4]
-    image.pixels.foreach_set(pixels)
-    image.update()
+    for tile in udim.tiles_of(image):
+        pixels = udim.read(image, tile)
+        pixels[..., 1] = 1.0 - pixels[..., 1]
+        udim.write(image, tile, pixels)
 
 
 # --- temporary bake targets -------------------------------------------------
@@ -264,20 +281,33 @@ def _remove_bake_target(material, node):
         pass
 
 
-def _new_bake_image(name, size, float_buffer=False, colorspace='sRGB'):
-    """A fresh image to bake into, replacing any previous one of that name."""
+def _new_bake_image(name, size, float_buffer=False, colorspace='sRGB',
+                    tiles=None):
+    """A fresh image to bake into, replacing any previous one of that name.
+
+    `tiles` makes it a UDIM image, `size` each.
+    """
     existing = bpy.data.images.get(name)
     if existing is not None:
-        matches = (
-            tuple(existing.size) == (size, size)
-            and existing.is_float == bool(float_buffer)
-        )
+        if tiles:
+            matches = udim.same_tiles(existing, tiles, size, float_buffer)
+        else:
+            matches = (
+                not udim.is_tiled(existing)
+                and tuple(existing.size) == (size, size)
+                and existing.is_float == bool(float_buffer)
+            )
         if matches:
             existing.colorspace_settings.name = colorspace
             return existing
-        # Wrong size or wrong precision: start over rather than baking into a
-        # mismatched buffer.
+        # Wrong size, wrong precision or the wrong tiles: start over rather
+        # than baking into a mismatched buffer.
         bpy.data.images.remove(existing)
+
+    if tiles:
+        # Colour space before the bake, for the reason given below.
+        return udim.new_image(name, size, (0.0, 0.0, 0.0, 0.0), tiles,
+                              colorspace, float_buffer=bool(float_buffer))
 
     image = bpy.data.images.new(
         name,
@@ -831,6 +861,34 @@ def _bake_joined(context, objects, materials, channel):
     return True
 
 
+def _bake_models(context, objects, materials, channel, bake_type, surface_normal):
+    """One bake of `objects`: alone, joined into one mesh, or all selected."""
+    if len(objects) == 1:
+        select_only(context, objects[0])
+        _bake_call(bake_type)
+    elif not surface_normal and _bake_joined(
+            context, objects, materials, channel):
+        # A surface normal is not joined: its tangents belong to each
+        # model's own shading, which a throwaway mesh would recompute.
+        pass
+    else:
+        # A channel that reads more than UVs, so the models cannot be
+        # joined: one bake call for all of them instead. Cycles bakes every
+        # selected object into its own materials' active image, and a
+        # shared image collects every object's islands: what it does not
+        # write it leaves alone (`use_clear` is off). One call per model
+        # used to cost a scene sync and kernel setup each, plus a full-size
+        # readback to merge -- 20 models, 3 channels, 2K: 32 s.
+        #
+        # Margin 0, so a model's margin cannot land on another model's
+        # islands; `bake_object` gives every island its margin with
+        # `dilate.fill` afterwards.
+        select_only(context, objects[0])
+        for model in objects[1:]:
+            model.select_set(True)
+        _bake_call(bake_type, margin=0)
+
+
 def bake_object(obj, size, margin=16, float_buffer=False, channel='BASE_COLOR',
                 settings=None, encode=False, normal_format='OPENGL'):
     """Bake one channel of every PaintR2 material on `obj` into its own image.
@@ -899,8 +957,12 @@ def bake_object(obj, size, margin=16, float_buffer=False, channel='BASE_COLOR',
     # for one, and reading a stack one drag out of date is silent and wrong.
     nodegen.flush()
 
-    # Make sure the shader matches the stack before reading it.
+    # Make sure the shader matches the stack before reading it -- and, on a
+    # UDIM material, that every tile the UVs reach has pixels to read.
+    from . import prepare
+
     for material in materials:
+        prepare.extend_tiles(material)
         nodegen.compile_material(material)
 
     from . import document as doc
@@ -915,6 +977,7 @@ def bake_object(obj, size, margin=16, float_buffer=False, channel='BASE_COLOR',
             bake_image_name(material, channel), size,
             float_buffer=_wants_float(channel, float_buffer),
             colorspace=doc_colorspace(channel),
+            tiles=udim.tiles_for(material),
         )
         targets.append((material, image, _add_bake_target(material, image)))
         detours.append(
@@ -940,29 +1003,9 @@ def bake_object(obj, size, margin=16, float_buffer=False, channel='BASE_COLOR',
         for _material, image, _node in targets:
             dilate.blank(image)
 
-        if len(objects) == 1:
-            select_only(context, objects[0])
-            _bake_call(bake_type)
-        elif not surface_normal and _bake_joined(
-                context, objects, materials, channel):
-            # A surface normal is not joined: its tangents belong to each
-            # model's own shading, which a throwaway mesh would recompute.
-            pass
-        else:
-            # A channel that reads more than UVs, so the models cannot be
-            # joined: one bake call for all of them instead. Cycles bakes every
-            # selected object into its own materials' active image, and a
-            # shared image collects every object's islands: what it does not
-            # write it leaves alone (`use_clear` is off). One call per model
-            # used to cost a scene sync and kernel setup each, plus a full-size
-            # readback to merge -- 20 models, 3 channels, 2K: 32 s.
-            #
-            # Margin 0, so a model's margin cannot land on another model's
-            # islands; `dilate.fill` below gives every island its margin.
-            select_only(context, objects[0])
-            for model in objects[1:]:
-                model.select_set(True)
-            _bake_call(bake_type, margin=0)
+        with _tile_margin(scene, [image for _, image, _ in targets]):
+            _bake_models(context, objects, materials, channel, bake_type,
+                         surface_normal)
 
         # Everything past the margin is still black with no alpha, and an
         # exported texture carries that black into whatever renders it: the
@@ -1024,11 +1067,14 @@ def bake_mask(obj, material, layer, margin=4):
         result.error = RuntimeError("this material has no output to bake from")
         return result
 
+    from . import prepare
+
+    prepare.extend_tiles(material)
     image = layer.mask_image
     if image is None:
-        from . import prepare
 
-        image, _ = prepare.ensure_image(
+        image, _ = prepare.image_for(
+            material,
             prepare.unique_image_name(f"{material.name}_{layer.name}_mask"),
             int(bpy.context.scene.paintr2.image_resolution),
             (1.0, 1.0, 1.0, 1.0),
@@ -1075,7 +1121,8 @@ def bake_mask(obj, material, layer, margin=4):
         select_only(context, obj)
 
         dilate.blank(image)
-        bpy.ops.object.bake(type='EMIT')
+        with _tile_margin(scene, [image]):
+            bpy.ops.object.bake(type='EMIT')
         dilate.fill(image)
 
         # The pattern is in the pixels now; leaving it switched on as well
@@ -1141,6 +1188,10 @@ def bake_mask_result(obj, material, layer, size=0, margin=4):
         result.error = RuntimeError("this material has no output to bake from")
         return result
 
+    from . import prepare
+
+    prepare.extend_tiles(material)
+
     if not size:
         painted = layer.mask_image
         size = painted.size[0] if painted is not None else int(
@@ -1194,12 +1245,14 @@ def bake_mask_result(obj, material, layer, size=0, margin=4):
         image = _new_bake_image(
             f"{material.name}_{layer.name}_mask_export", size,
             float_buffer=False, colorspace='Non-Color',
+            tiles=udim.tiles_for(material),
         )
         target = _add_bake_target(material, image)
 
         select_only(context, obj)
         dilate.blank(image)
-        bpy.ops.object.bake(type='EMIT')
+        with _tile_margin(scene, [image]):
+            bpy.ops.object.bake(type='EMIT')
         dilate.fill(image)
 
         result.images = [(material, image)]
@@ -1382,12 +1435,17 @@ def file_name(name):
 
 
 def save_image(image, directory, file_format='PNG'):
-    """Write `image` into `directory`, returning the absolute path."""
+    """Write `image` into `directory`, returning the absolute path.
+
+    A UDIM image is one file per tile; the path returned carries Blender's
+    `<UDIM>` token where the tile number goes.
+    """
     directory = bpy.path.abspath(directory)
     os.makedirs(directory, exist_ok=True)
 
     extension = FILE_FORMATS.get(file_format, ".png")
-    path = os.path.join(directory, file_name(image.name) + extension)
+    tile = ".<UDIM>" if udim.is_tiled(image) else ""
+    path = os.path.join(directory, file_name(image.name) + tile + extension)
 
     image.filepath_raw = path
     image.file_format = file_format

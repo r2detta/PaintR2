@@ -132,12 +132,8 @@ BINDINGS = (
     Binding('M', 'mask_solo', "Show the mask on its own", shift=True),
     Binding('I', 'layer_solo', "Show this layer on its own"),
 
-    # Ours only when we actually have a fill to undo -- the handler says so,
-    # and a key nobody claims goes on to Blender. A brush stroke is still
-    # Blender's to undo; a fill was never in its stack to begin with.
-    Binding('Z', 'fill_undo', "Undo a fill", context='ANY', ctrl=True),
-    Binding('Z', 'fill_redo', "Redo a fill", context='ANY', ctrl=True,
-            shift=True),
+    # No Ctrl+Z here. A fill is a step of Blender's own undo now, so
+    # the key goes to Blender for everything, in the order things were done.
 
     Binding('F1', 'shortcuts', "Show this list", context='CHROME'),
     Binding('SLASH', 'shortcuts', "Show this list", context='CHROME',

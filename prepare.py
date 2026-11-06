@@ -33,6 +33,7 @@ import bpy
 from . import nodegen
 from . import paintset
 from . import storage
+from . import udim
 
 
 PAINT_SUFFIX = "_Paint"
@@ -65,7 +66,7 @@ def is_paint_material(material):
 # --- images -----------------------------------------------------------------
 
 
-def ensure_image(name, resolution, color, colorspace='sRGB'):
+def ensure_image(name, resolution, color, colorspace='sRGB', tiles=None):
     """Return (image, created). Reuses an existing image with the same name.
 
     A reused image is left exactly as it is -- resizing or reflooding it would
@@ -75,26 +76,79 @@ def ensure_image(name, resolution, color, colorspace='sRGB'):
     into an sRGB image and reading it back gives 0.74, so a mask that looks
     half-open would cut three quarters of the layer. Masks are Non-Color; the
     Base Color image a brush paints stays sRGB.
+
+    `tiles` makes it a UDIM image with those tiles, `resolution` each.
     """
     image = bpy.data.images.get(name)
     if image is not None:
         return image, False
 
-    image = bpy.data.images.new(
-        name,
-        width=resolution,
-        height=resolution,
-        alpha=True,
-    )
-    image.colorspace_settings.name = colorspace
-    image.generated_color = tuple(color)
+    if tiles:
+        image = udim.new_image(name, resolution, tuple(color), tiles, colorspace)
+    else:
+        image = bpy.data.images.new(
+            name,
+            width=resolution,
+            height=resolution,
+            alpha=True,
+        )
+        image.colorspace_settings.name = colorspace
+        image.generated_color = tuple(color)
 
     # Write it out immediately when there is a folder to write into. A
     # GENERATED image loses its pixels the moment the .blend is saved, so the
     # sooner it becomes a real file the better. See storage.py.
     storage.adopt_new_image(image)
 
+    # Before the memfile step of whatever made it: written with the tags of
+    # its creation, it would lose its first strokes to a later Ctrl+Z.
+    from . import history
+
+    history.guard_images([image])
+
     return image, True
+
+
+def image_for(material, name, resolution, color, colorspace='sRGB', tiles=None):
+    """`ensure_image` for a layer of `material`: UDIM when the material is.
+
+    `tiles` is for a material no object uses yet; otherwise its UVs decide.
+    """
+    if material.paintr2.is_udim:
+        tiles = tiles or udim.material_tiles(material)[0]
+    else:
+        tiles = None
+    return ensure_image(name, resolution, color, colorspace, tiles)
+
+
+def extend_tiles(material):
+    """Give `material`'s UDIM images the tiles its UVs have reached since.
+
+    Run where a stale tile set would show: "Set Models", opening the window and
+    before a bake. Never removes a tile -- one no UV uses any more may still
+    hold paint someone wants back. Returns how many tiles were added.
+    """
+    if not getattr(getattr(material, "paintr2", None), "is_udim", False):
+        return 0
+
+    tiles = udim.material_tiles(material)[0]
+    added = 0
+    for image in storage.layer_images(material):
+        if not udim.is_tiled(image) or set(tiles) <= set(udim.tiles_of(image)):
+            continue
+        packed = image.packed_file is not None
+        if packed:
+            # Into memory while the packed copy is still there to load from:
+            # adding the tile unpacks the image.
+            for tile in udim.tiles_of(image):
+                udim.read(image, tile)
+        added += len(udim.add_tiles(image, tiles))
+        if packed and not storage.repack(image):
+            print(f"[PaintR2] {image.name} took a new tile and could not be "
+                  f"packed again; save the .blend to keep it")
+    if added:
+        print(f"[PaintR2] {material.name}: {added} new UDIM tile(s)")
+    return added
 
 
 def unique_image_name(base):
@@ -126,14 +180,20 @@ def base_image_name(material):
 BASE_LAYER_NAME = "Base"
 
 
-def seed_document(material, resolution, color):
-    """Give `material` a stack with one base paint layer, if it has none."""
+def seed_document(material, resolution, color, use_udim=False, tiles=None):
+    """Give `material` a stack with one base paint layer, if it has none.
+
+    `use_udim` only counts the moment the material becomes a PaintR2 material.
+    A document that already is one keeps what it was given then.
+    """
     document = material.paintr2
+    if not document.is_paint and not len(document.layers):
+        document.is_udim = use_udim
     document.is_paint = True
 
     if not len(document.layers):
-        image, _ = ensure_image(
-            base_image_name(material), resolution, color
+        image, _ = image_for(
+            material, base_image_name(material), resolution, color, tiles=tiles
         )
         layer = document.add_layer(BASE_LAYER_NAME, 'PAINT', above_active=False)
         layer.image = image
@@ -142,7 +202,7 @@ def seed_document(material, resolution, color):
     return material
 
 
-def reset_material(material, resolution, color):
+def reset_material(material, resolution, color, use_udim=False):
     """Wipe what `material` was and make it a PaintR2 material of the same name.
 
     The whole node tree goes, not only the nodes PaintR2 owns: the point is
@@ -165,24 +225,28 @@ def reset_material(material, resolution, color):
     document.active_effect = -1
     document.solo_mode = 'NONE'
     document.solo_index = -1
-    document.is_paint = True
+    # A reset is the start over: `seed_document` takes it from here as new.
+    document.is_paint = False
 
-    return seed_document(material, resolution, color)
+    return seed_document(material, resolution, color, use_udim)
 
 
-def ensure_paint_material(name, resolution, color):
+def ensure_paint_material(name, resolution, color, use_udim=False, tiles=None):
     """Return (material, created): a PaintR2 material called `name`.
 
     Used for the slot that has no material of its own to keep the name of.
     An existing document is never touched -- that is what makes running "Set
     Models" a second time harmless.
+
+    `tiles` is here because the material is seeded before it is in a slot,
+    when no object can yet answer for its UVs.
     """
     material = bpy.data.materials.get(name)
     created = material is None
     if created:
         material = bpy.data.materials.new(name)
 
-    seed_document(material, resolution, color)
+    seed_document(material, resolution, color, use_udim, tiles)
     return material, created
 
 
@@ -198,6 +262,9 @@ class PrepareReport:
         self.reused = []        # material names that were already ours
         self.moved = []         # object names moved into the Paint collection
         self.no_uv = []         # object names with no UV map
+        self.bad_tiles = []     # names of UDIM objects with faces off the grid
+        self.crossing = []      # names of UDIM objects with islands over a tile border
+        self.unseamed = []      # names of UDIM objects whose UVs run on across tiles
         self.skipped = []       # (object name, reason)
 
     @property
@@ -229,7 +296,17 @@ def _unique_material_name(base):
     return f"{base} {index}"
 
 
-def prepare_object(obj, resolution, color, report):
+def _tiles_of_slot(obj, index, use_udim, report):
+    """The tiles a slot of `obj` needs, or None when UDIM is not wanted."""
+    if not use_udim:
+        return None
+    tiles, invalid = udim.object_tiles(obj, index)
+    if invalid and obj.name not in report.bad_tiles:
+        report.bad_tiles.append(obj.name)
+    return tiles or [1001]
+
+
+def prepare_object(obj, resolution, color, report, use_udim=False):
     """Give every material slot of `obj` a PaintR2 stack.
 
     With no slots at all, one is added named after the object. With existing
@@ -245,9 +322,18 @@ def prepare_object(obj, resolution, color, report):
     if not mesh.uv_layers:
         report.no_uv.append(obj.name)
 
+    # One of the two, not both: an island running over a border also has
+    # edges the brush does not bleed across, and the cure for that -- keep
+    # it inside one tile -- is the crossing warning's.
+    if use_udim and udim.crossing_faces(mesh):
+        report.crossing.append(obj.name)
+    elif use_udim and udim.unseamed_edges(mesh):
+        report.unseamed.append(obj.name)
+
     if not obj.material_slots:
         material, created = ensure_paint_material(
-            _unique_material_name(paint_name(obj.name)), resolution, color
+            _unique_material_name(paint_name(obj.name)), resolution, color,
+            use_udim, _tiles_of_slot(obj, None, use_udim, report),
         )
         mesh.materials.append(material)
         (report.created if created else report.reused).append(material.name)
@@ -261,7 +347,8 @@ def prepare_object(obj, resolution, color, report):
             base = paint_name(obj.name) if index == 0 else \
                 paint_name(f"{obj.name}_{index}")
             material, created = ensure_paint_material(
-                _unique_material_name(base), resolution, color
+                _unique_material_name(base), resolution, color,
+                use_udim, _tiles_of_slot(obj, index, use_udim, report),
             )
             slot.material = material
             (report.created if created else report.reused).append(material.name)
@@ -274,11 +361,13 @@ def prepare_object(obj, resolution, color, report):
             report.reused.append(source.name)
             continue
 
-        reset_material(source, resolution, color)
+        if use_udim:
+            _tiles_of_slot(obj, index, use_udim, report)
+        reset_material(source, resolution, color, use_udim)
         report.reset.append(source.name)
 
 
-def prepare_objects(objects, resolution, color, context=None):
+def prepare_objects(objects, resolution, color, context=None, use_udim=False):
     """Make `objects` the paint set and prepare their materials.
 
     Returns a PrepareReport. The collection move comes first: a material
@@ -296,10 +385,21 @@ def prepare_objects(objects, resolution, color, context=None):
     if not meshes:
         return report
 
+    if use_udim:
+        # A floor, not a value: this is the user's Bleed setting from here on.
+        settings = context.scene.tool_settings.image_paint
+        settings.seam_bleed = max(settings.seam_bleed, udim.SEAM_BLEED)
+
     paint, _high = paintset.ensure_pair(context)
     report.moved = [obj.name for obj in paintset.move_into(meshes, paint)]
 
     for obj in meshes:
-        prepare_object(obj, resolution, color, report)
+        prepare_object(obj, resolution, color, report, use_udim)
+
+    # A material that was already ours may have models with new UVs in it now.
+    for obj in meshes:
+        for slot in obj.material_slots:
+            if slot.material is not None:
+                extend_tiles(slot.material)
 
     return report

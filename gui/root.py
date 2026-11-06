@@ -306,7 +306,6 @@ class UIRoot(Container):
         self.on_effect_remove = None
         self.on_effect_move = None
         self.on_mask_bake = None
-        self.on_fill_undo = None
         # (side, width) -- a panel was resized by dragging its edge.
         self.on_panel_width = None
         self.on_layer_move = None
@@ -4227,10 +4226,6 @@ class UIRoot(Container):
             'layer_copy': lambda _e: self._ask(self.on_layer_copy),
             'layer_paste': lambda _e: self._ask(self.on_layer_paste),
             'shortcuts': self._key_shortcuts,
-            # These two answer for themselves: when there is no fill to undo
-            # the binding reports "not handled" and Blender gets the key.
-            'fill_undo': lambda _e: self._ask(self.on_fill_undo, False),
-            'fill_redo': lambda _e: self._ask(self.on_fill_undo, True),
         }
 
     def _ask(self, callback, *args):

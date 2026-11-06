@@ -473,6 +473,17 @@ class PR2_SceneProps(PropertyGroup):
         default=False,
     )
 
+    # Goes up with every pixel edit history.py makes an undo step of.
+    # It lives on the scene because the scene is in Blender's memfile undo:
+    # stepping back past one of those edits brings the number from before it
+    # back, and that is how the undo handler tells which edits were undone.
+    undo_serial: IntProperty(
+        name="Undo Serial",
+        description="Internal: counts PaintR2's pixel edits for undo",
+        default=0,
+        options={'HIDDEN'},
+    )
+
     # Where the window was when PaintR2 took it over. Also on the session, but
     # a file saved mid-session opens on the PaintR2 workspace with no session
     # behind it, and this is how it finds its way back.
@@ -520,6 +531,13 @@ class PR2_SceneProps(PropertyGroup):
         min=0.0,
         max=1.0,
         default=(1.0, 1.0, 1.0, 1.0),
+    )
+
+    image_udim: BoolProperty(
+        name="UDIM",
+        description="Make one texture per UV tile, at the resolution above. "
+        "Chosen when a material is prepared and cannot be changed afterwards",
+        default=False,
     )
 
     # --- bake / export -------------------------------------------------------
@@ -701,7 +719,8 @@ class PR2_SceneProps(PropertyGroup):
              "Correct across a seam, and the one to want"),
             ('EXTEND', "Extend",
              "Smear the island's edge pixels outward. Cheaper, and wrong "
-             "across a seam"),
+             "across a seam. Always used on a UDIM material: there Adjacent "
+             "Faces reads the wrong tile across a seam"),
         ),
         default='ADJACENT_FACES',
     )

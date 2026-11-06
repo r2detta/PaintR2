@@ -923,6 +923,15 @@ class PR2_Document(PropertyGroup):
         default=False,
     )
 
+    # Whether this material's images are UDIM. "Set Models" writes it when the
+    # material becomes a PaintR2 material and nothing writes it afterwards:
+    # every image of the stack has to agree, and there is no conversion.
+    is_udim: BoolProperty(
+        name="UDIM",
+        description="This material's images hold one texture per UV tile",
+        default=False,
+    )
+
     # Whether a mesh map bake makes this material's maps. Maps are per
     # material, so this is the one place to say "not this texture set
     # this time" -- ticked in the Objects / Materials list.

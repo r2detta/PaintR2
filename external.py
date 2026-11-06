@@ -267,16 +267,42 @@ def material_slots(obj, material):
     return set(slots)
 
 
-def _triangles_in(mesh, slots):
-    """A mask over `mesh.loop_triangles` of the ones in `slots`, or None."""
-    if slots is None:
+def _triangles_in(mesh, slots, tile=None):
+    """A mask over `mesh.loop_triangles` of the ones in `slots` and on UDIM
+    tile `tile`, or None when that is all of them."""
+    if slots is None and tile is None:
         return None
-    indices = np.empty(len(mesh.loop_triangles), dtype=np.int32)
-    mesh.loop_triangles.foreach_get("material_index", indices)
-    return np.isin(indices, list(slots))
+
+    keep = np.ones(len(mesh.loop_triangles), dtype=bool)
+    if slots is not None:
+        indices = np.empty(len(mesh.loop_triangles), dtype=np.int32)
+        mesh.loop_triangles.foreach_get("material_index", indices)
+        keep &= np.isin(indices, list(slots))
+    if tile is not None:
+        keep &= _triangle_tiles(mesh) == tile
+    return keep
 
 
-def low_poly_soup(obj, depsgraph, slots=None):
+def _triangle_tiles(mesh):
+    """The UDIM tile of each loop triangle, by its middle; 0 off the grid."""
+    from . import udim
+
+    loops = np.empty(len(mesh.loop_triangles) * 3, dtype=np.int32)
+    mesh.loop_triangles.foreach_get("loops", loops)
+    uvs = np.empty(len(mesh.loops) * 2, dtype=np.float32)
+    mesh.uv_layers.active.uv.foreach_get("vector", uvs)
+    middles = np.floor(uvs.reshape(-1, 2)[loops].reshape(-1, 3, 2).mean(axis=1))
+    middles = middles.astype(np.int32)
+    return udim.tile_numbers(middles[:, 0], middles[:, 1])
+
+
+def tile_offset(tile):
+    """The UV corner of UDIM tile `tile`: 1002 is (1, 0), 1011 is (0, 1)."""
+    index = tile - 1001
+    return float(index % 10), float(index // 10)
+
+
+def low_poly_soup(obj, depsgraph, slots=None, tile=None):
     """The low-poly as a triangle soup: 3 corners of position, normal, uv,
     tangent and bitangent sign.
 
@@ -299,6 +325,10 @@ def low_poly_soup(obj, depsgraph, slots=None):
     `slots` keeps only the faces of those material slots (`material_slots`):
     a map belongs to a material, and the model's other materials have their
     own maps -- often over the same 0..1 square.
+
+    `tile` keeps only the faces on that UDIM tile and moves their UVs back onto
+    0..1, which is the only square the baker rasterises. One run per tile
+    leaves the binary exactly as it is.
     """
     evaluated, mesh, matrix, normal_matrix = _evaluated(obj, depsgraph)
     try:
@@ -320,12 +350,15 @@ def low_poly_soup(obj, depsgraph, slots=None):
         loops = np.empty(triangles * 3, dtype=np.int32)
         mesh.loop_triangles.foreach_get("loops", loops)
 
-        keep = _triangles_in(mesh, slots)
+        keep = _triangles_in(mesh, slots, tile)
         if keep is not None:
             loops = loops.reshape(-1, 3)[keep].reshape(-1)
             triangles = int(keep.sum())
             if triangles == 0:
-                raise RuntimeError(f"{obj.name} has no faces of this material")
+                where = f" on tile {tile}" if tile is not None else ""
+                raise RuntimeError(
+                    f"{obj.name} has no faces of this material{where}"
+                )
 
         loop_vertex = np.empty(len(mesh.loops), dtype=np.int32)
         mesh.loops.foreach_get("vertex_index", loop_vertex)
@@ -348,6 +381,8 @@ def low_poly_soup(obj, depsgraph, slots=None):
         uvs = np.empty(len(mesh.loops) * 2, dtype=np.float32)
         mesh.uv_layers.active.uv.foreach_get("vector", uvs)
         uvs = uvs.reshape(-1, 2)
+        if tile is not None:
+            uvs -= np.array(tile_offset(tile), dtype=np.float32)
 
         positions = _to_world(coords[loop_vertex[loops]], matrix)
         normals = _directions_to_world(corner_normals[loops], normal_matrix)
@@ -402,20 +437,22 @@ def high_poly_indexed(obj, depsgraph):
         evaluated.to_mesh_clear()
 
 
-def other_faces(obj, depsgraph, slots):
-    """The faces of `obj` *outside* `slots`, as (positions, indices), or None.
+def other_faces(obj, depsgraph, slots, tile=None):
+    """The faces of `obj` *outside* `slots` (and `tile`), as (positions,
+    indices), or None.
 
     Left out of the soup because they are another material's texture, they
     are still this model's surface and still shadow it -- so they go to the
     baker as occluders, which is what keeps AO the same as it was before the
-    model was split by material.
+    model was split by material. The faces on the other UDIM tiles are the
+    same case: another run writes them, this one must still see them.
     """
-    if slots is None:
+    if slots is None and tile is None:
         return None
     evaluated, mesh, matrix, _normal_matrix = _evaluated(obj, depsgraph)
     try:
         mesh.calc_loop_triangles()
-        keep = _triangles_in(mesh, slots)
+        keep = _triangles_in(mesh, slots, tile)
         if keep is None or keep.all():
             return None
         tris = np.empty(len(mesh.loop_triangles) * 3, dtype=np.int64)
@@ -517,8 +554,18 @@ def write_input(path, low, high, size, samples, maps, params, flags=0,
             handle.write(occ_idx.tobytes())
 
 
+# Tile runs whose Position must be moved into the whole model's box, by input
+# path: (run lo, run span, model lo, model span). See `prepare`.
+_REBOX = {}
+
+
 def read_output(path):
-    """Read a `.pr2m`. Returns {map name: (size, size, 4) float32}."""
+    """Read a `.pr2m`. Returns {map name: (size, size, 4) float32}.
+
+    A tile run's Position comes back in the box of that tile's faces, which is
+    all the baker saw; it is moved into the model's here, before anyone reads
+    it. `path` is the output path, the input's with `.pr2m` for `.pr2b`.
+    """
     with open(path, "rb") as handle:
         magic, version, size, count = _OUTPUT_HEADER.unpack(
             handle.read(_OUTPUT_HEADER.size)
@@ -539,7 +586,20 @@ def read_output(path):
             )
             name = BIT_MAPS.get(identifier, f"UNKNOWN_{identifier}")
             maps[name] = raw.reshape(size, size, 4).copy()
-        return maps
+
+    box = _REBOX.pop(path[:-5] + ".pr2b", None)
+    if box is not None and 'POSITION' in maps:
+        _rebox(maps['POSITION'], *box)
+    return maps
+
+
+def _rebox(pixels, run_lo, run_span, lo, span):
+    """Re-normalise a Position map from one box into another, in place."""
+    covered = pixels[..., 3] > 0.5
+    world = pixels[..., :3] * run_span + run_lo
+    pixels[..., :3] = np.where(
+        covered[..., None], np.clip((world - lo) / span, 0.0, 1.0), pixels[..., :3]
+    )
 
 
 def run(binary, input_path, output_path, on_progress=None):
@@ -669,7 +729,7 @@ class Job:
 
 
 def prepare(obj, high, directory, size, samples, maps, options,
-            occluders=(), material=None):
+            occluders=(), material=None, tile=None):
     """Write the input file for one object. Returns its path.
 
     `material` limits the bake to that material's faces -- the map is the
@@ -681,15 +741,22 @@ def prepare(obj, high, directory, size, samples, maps, options,
     `options` is a `meshmaps.BakeOptions`; taking it rather than a pile of
     numbers keeps the two backends reading the same settings, which is what
     makes switching between them a fair comparison instead of a surprise.
+
+    `tile` bakes one UDIM tile: only its faces, their UVs moved onto 0..1.
+    Two numbers the baker derives from what it is given would then come from
+    that tile alone, so with no high-poly (whose box the tile does not change)
+    they are fixed here: Thickness reaches as far as on the whole model, and
+    Position is moved into the whole model's box on the way back in
+    (`read_output`). Without that, every tile of the map is its own 0..1.
     """
     depsgraph = bpy.context.evaluated_depsgraph_get()
     slots = material_slots(obj, material)
-    low = low_poly_soup(obj, depsgraph, slots)
+    low = low_poly_soup(obj, depsgraph, slots, tile)
     packed = high_poly_indexed(high, depsgraph) if high is not None else None
     wants_occlusion = maps & (MAP_BITS['AO'] | MAP_BITS['BENT_NORMAL'])
     # With a high-poly the high-poly is the shape that shadows, all of it;
     # the low-poly's other faces would only shadow twice.
-    rest = (other_faces(obj, depsgraph, slots)
+    rest = (other_faces(obj, depsgraph, slots, tile)
             if wants_occlusion and high is None else None)
     blockers = (occluder_mesh(occluders, depsgraph, extra=rest)
                 if (occluders or rest is not None) and wants_occlusion
@@ -719,6 +786,15 @@ def prepare(obj, high, directory, size, samples, maps, options,
     params[PARAM_CURVATURE_LOW] = options.curvature_low
     params[PARAM_CURVATURE_HIGH] = options.curvature_high
 
+    key = (obj.name, material.name if material is not None else "", tile)
+    path = os.path.join(directory, f"paintr2_{abs(hash(key)):x}.pr2b")
+
+    if tile is not None and high is None:
+        params[PARAM_THICKNESS_REACH] = diagonal * meshmaps.THICKNESS_REACH
+        whole = low_poly_soup(obj, depsgraph, slots)[1][:, 0:3]
+        part = low[1][:, 0:3]
+        _REBOX[path] = (part.min(axis=0), _span(part), whole.min(axis=0), _span(whole))
+
     flags = 0
     if options.flip_green:
         flags |= FLAG_FLIP_GREEN
@@ -727,37 +803,47 @@ def prepare(obj, high, directory, size, samples, maps, options,
     if options.ao_ignore_backface:
         flags |= FLAG_AO_IGNORE_BACKFACE
 
-    key = (obj.name, material.name if material is not None else "")
-    path = os.path.join(directory, f"paintr2_{abs(hash(key)):x}.pr2b")
     write_input(path, low, packed, size, samples, maps, params, flags,
                 occluders=blockers)
     return path
 
 
+def _span(points):
+    return np.maximum(points.max(axis=0) - points.min(axis=0), 1e-6)
+
+
 def apply_maps(material, produced):
     """Turn the baker's arrays into Blender images, filled and stored.
 
-    `material` owns them; `produced` is every model's share already laid
-    together with `meshmaps.merge_coverage`.
+    `material` owns them; `produced` is {map: {tile: pixels}}, every model's
+    share already laid together with `meshmaps.merge_coverage`. The tile is
+    None for a plain material, and a UDIM one gets a UDIM image with all of
+    its tiles -- a tile no run produced stays empty rather than missing.
 
     The alpha the baker writes is its coverage mask, which is exactly what
     `dilate.fill` needs -- so the same filling the Cycles path uses runs here
     too, rather than a second implementation that could drift from it.
     """
-    from . import dilate, meshmaps, storage
+    from . import dilate, meshmaps, storage, udim
 
     images = {}
-    for identifier, pixels in produced.items():
+    for identifier, tiles in produced.items():
         entry = meshmaps.entry_for(identifier)
-        if entry is None:
+        if entry is None or not tiles:
             continue
-        size = pixels.shape[0]
+        size = next(iter(tiles.values())).shape[0]
+        numbers = udim.tiles_for(material)
+        if numbers is not None:
+            numbers = sorted(set(numbers) | {t for t in tiles if t is not None})
         image = meshmaps._ensure_image(
             meshmaps.map_name(material, identifier), size, entry[2],
-            float_buffer=entry[4],
+            float_buffer=entry[4], tiles=numbers,
         )
-        image.pixels.foreach_set(pixels.reshape(-1))
-        image.update()
+        dilate.blank(image)
+        for tile, pixels in tiles.items():
+            if tile is None and numbers is not None:
+                continue  # a plain run cannot say which tile it was
+            udim.write(image, tile, pixels)
         dilate.fill(image)
         storage.adopt_new_image(image)
         meshmaps._store(material, identifier, image)

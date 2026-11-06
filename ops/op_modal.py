@@ -19,8 +19,10 @@ where the pointer has wandered to.
 
 import bpy
 
+from .. import history
 from .. import paint
 from .. import session
+from .. import storage
 from .. import window as window_mod
 from ..gui.widget import UIEvent
 from .op_fill import FillStroke
@@ -183,6 +185,11 @@ class PAINTR2_OT_ui_modal(bpy.types.Operator):
                         area.tag_redraw()
 
                 self._retune(context, state.root)
+
+                # A brush stroke that just ended tagged its image in a way
+                # that makes Blender's memfile undo drop the painting; this
+                # takes the tag back before anything writes a memfile.
+                history.guard_images(storage.layer_images())
             return {'PASS_THROUGH'}
 
         current_window = getattr(context, "window", None)
@@ -264,6 +271,9 @@ class PAINTR2_OT_ui_modal(bpy.types.Operator):
         # The tree always sees the event, even over the viewport, so hover
         # state stays correct as the mouse crosses the boundary.
         consumed = state.root.handle_event(ui_event)
+
+        # A slider let go, a menu closed: the edit it made is one undo step.
+        window_mod.flush_edit_undo(state.root)
 
         # Whatever that event started or ended, the pointer says so: a row in
         # the air gets a closed hand, the scrollbar gets a scroll cursor.

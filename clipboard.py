@@ -29,6 +29,7 @@ since been reordered points at a different layer.
 """
 
 import bpy
+import numpy as np
 
 
 # What was copied, as plain dicts. See `_read_group`.
@@ -135,21 +136,29 @@ def duplicate_image(image):
     if image is None:
         return None
 
+    from . import udim
+
     clone = image.copy()
     clone.name = f"{image.name}_copy"
 
-    width, height = image.size
     channels = image.channels
-    expected = width * height * channels
-    if expected and len(image.pixels) == expected:
-        buffer = [0.0] * expected
-        image.pixels.foreach_get(buffer)
-        # A GENERATED clone has to become the size it claims before its
-        # buffer will accept anything; setting the source is what allocates.
-        if clone.size[0] != width or clone.size[1] != height:
-            clone.scale(width, height)
-        clone.pixels.foreach_set(buffer)
-        clone.update()
+    for tile in udim.tiles_of(image):
+        width, height = udim.tile_size(image, tile)
+        expected = width * height * channels
+        if not expected:
+            continue
+        with udim.on_tile(image, tile) as source:
+            if len(source.pixels) != expected:
+                continue
+            buffer = np.empty(expected, dtype=np.float32)
+            source.pixels.foreach_get(buffer)
+        with udim.on_tile(clone, tile) as target:
+            # A GENERATED clone has to become the size it claims before its
+            # buffer will accept anything; setting the source is what allocates.
+            if target.size[0] != width or target.size[1] != height:
+                target.scale(width, height)
+            target.pixels.foreach_set(buffer)
+            target.update()
 
     if image.packed_file:
         clone.pack()

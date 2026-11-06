@@ -63,7 +63,8 @@ ln -s "$PWD/PaintR2" ~/.config/blender/5.2/extensions/user_default/PaintR2
 
 1. In the 3D viewport, select the mesh (or meshes) you want to paint.
 2. Press `N` to open the sidebar and switch to the **PaintR2** tab.
-3. Choose a resolution, then press **Set Models**.
+3. Choose a resolution, then press **Set Models**. Tick **UDIM** first if the
+   model's UVs use more than one tile — it is chosen once per material.
    An object with no material gets one called `<object>_Paint`; an object that
    already has one **keeps the name but has the material reset in place** — so
    whatever was in that material is gone, and only its name survives.
@@ -102,7 +103,8 @@ baking, saving layer images and export — happens in the PaintR2 workspace.
 - **Mesh Fill** — connected part or whole object
 - **UV Island Fill** — one UV island
 - Box and lasso selection, drag to fill, edge softening and bleed
-- Its own undo ring (`Ctrl Z`)
+- Undone with `Ctrl Z` in the order they were made, together with brush strokes
+  and layer changes
 
 **Channels**
 - **Base Color, Roughness, Metallic, Normal and Height** on every material
@@ -137,6 +139,17 @@ baking, saving layer images and export — happens in the PaintR2 workspace.
   shadow a model's Ambient Occlusion or it is baked as if alone
 - Look at any baked map on the model with one click
 
+**UDIM**
+- Tick **UDIM** in Set Models: every layer, mask, mesh map and exported texture
+  is one image per UV tile (`<name>.1001.png`, `<name>.1002.png`, …), all tiles
+  at the chosen resolution
+- Brush strokes, fills, masks and bakes work across tiles
+- The tiles follow the UVs: an island moved onto a new tile gets that tile when
+  the window opens or a bake runs; a tile no UV uses any more is kept, with its
+  paint
+- Set Models warns about UVs outside the tile grid, UV islands that cross a
+  tile border, and UV edges where thin lines may show
+
 **Multiple objects and materials** — painted as one set, and exported together.
 
 ---
@@ -155,7 +168,7 @@ Press `F1` or `?` inside PaintR2 for the full list. The common ones:
 | `X` | Delete the layer, its mask, or the selected filter |
 | `Ctrl G` | Group the selected layers |
 | `Ctrl C` / `Ctrl V` | Copy / paste layers |
-| `Ctrl Z` | Undo a fill |
+| `Ctrl Z` / `Ctrl Shift Z` | Undo / redo — strokes, fills and layer changes, in order |
 
 On macOS, `Cmd` works wherever `Ctrl` is listed.
 
@@ -195,7 +208,11 @@ The release binaries are built by `.github/workflows/build.yml`.
   stays. Rescaling would mean resampling every layer and every mask, which is an
   unrecoverable loss. If you started wrong, the way out is a new material.
 - **One PaintR2 session at a time.**
-- **No UDIM.** A single UV tile.
+- **UDIM is chosen once.** It is set in Set Models and stays: a plain material
+  does not become UDIM later, or the other way round. All tiles share one
+  resolution.
+- **Keep each UV island inside one tile.** Fills and the accelerated baker stop
+  at a tile border; Set Models says which models have an island over one.
 - **The brush paints Base Color only.** Roughness, Metallic, Normal and Height
   are given by Fill layers (a value or an image) and shaped with masks.
 - No smart materials or smart masks.

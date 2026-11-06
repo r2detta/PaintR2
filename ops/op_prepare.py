@@ -34,7 +34,9 @@ undone from inside PaintR2 -- the original surface is gone.
         resolution = int(props.image_resolution)
         color = tuple(props.image_base_color)
 
-        report = prepare.prepare_objects(targets, resolution, color, context)
+        report = prepare.prepare_objects(
+            targets, resolution, color, context, props.image_udim
+        )
 
         if not report.touched and not report.moved:
             self.report({'WARNING'}, "Nothing prepared: no mesh objects selected")
@@ -45,14 +47,26 @@ undone from inside PaintR2 -- the original surface is gone.
         # everything else must stay hidden.
         _resync_session(context)
 
-        if report.no_uv:
-            names = ", ".join(report.no_uv[:3])
-            more = "..." if len(report.no_uv) > 3 else ""
-            self.report(
-                {'WARNING'},
-                f"{report.summary()}. No UV map on: {names}{more} - "
-                f"unwrap before painting",
+        # Every problem found is said, in one line. Only the first used to be,
+        # so a model with faces off the grid never heard about the island
+        # that also ran over a border.
+        warnings = [
+            f"{label} on: {_names(names)} - {cure}"
+            for names, label, cure in (
+                (report.bad_tiles, "UVs outside the UDIM grid",
+                 "those faces get no texture"),
+                (report.crossing, "UV islands cross a tile border",
+                 "fills and the external baker stop at the border; "
+                 "keep each island inside one tile"),
+                (report.unseamed, "Thin lines may show",
+                 "part of a UV shell sits a whole tile away from the rest; "
+                 "pull the parts slightly apart"),
+                (report.no_uv, "No UV map", "unwrap before painting"),
             )
+            if names
+        ]
+        if warnings:
+            self.report({'WARNING'}, ". ".join([report.summary()] + warnings))
         else:
             self.report({'INFO'}, report.summary())
 
@@ -98,6 +112,11 @@ compiled shader all stay, so putting the model back in re-opens the same work.
         self.report({'INFO'}, f"{len(moved)} model(s) removed from "
                               f"{paintset.PAINT}")
         return {'FINISHED'}
+
+
+def _names(names):
+    """At most three object names for a status line, then an ellipsis."""
+    return ", ".join(names[:3]) + ("..." if len(names) > 3 else "")
 
 
 def _resync_session(context):

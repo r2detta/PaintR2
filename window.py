@@ -4563,6 +4563,9 @@ def _set_panel_prop(owner, key, value):
     if holder is None:
         return
 
+    if owner in _DOCUMENT_OWNERS or owner.startswith('ch:'):
+        _mark_edit()
+
     # A uniform scale: whichever field moved, all three follow it.
     if owner == 'projection' and key == "scale" and index is not None \
             and getattr(holder, "uniform_scale", False):
@@ -4826,17 +4829,80 @@ def _set_symmetry_planes(enabled):
     session.tag_redraw()
 
 
+# --- undo for edits made straight through RNA --------------------------------
+#
+# A slider drag writes the property on every move, and an undo step per move
+# is a stack nobody wants. So the setters below only say that a document edit
+# happened; the modal pushes one step for it once the interaction is over --
+# the button is up and no menu or picker is open. Without a step of
+# its own the edit was undone together with whatever came before it.
+
+# The owners `_set_panel_prop` writes that belong to the document: the layer,
+# its channels, procedurals, projection, adjustment and effects. Brush, tool
+# and view settings are not undone, the same as in any paint program.
+_DOCUMENT_OWNERS = (
+    'adjust', 'proc', 'proc_mask', 'projection', 'doc',
+    'effect', 'effect_filter', 'effect_pattern',
+)
+
+_pending_edit = None
+
+
+def _mark_edit(label="Layer Property"):
+    global _pending_edit
+    if _pending_edit is None:
+        _pending_edit = label
+
+
+def flush_edit_undo(root):
+    """Push the waiting document edit as one undo step, if its gesture ended."""
+    global _pending_edit
+    if _pending_edit is None or root is None:
+        return
+    if root.has_capture or root.has_overlay:
+        return
+    label, _pending_edit = _pending_edit, None
+
+    from . import history
+
+    history.push_memfile(label)
+
+
 def _run(description, operator, *args, **kwargs):
     """Call an operator from the interface, reporting failures to the console.
 
     `args` is there for the one thing an operator call takes positionally --
     the execution context, `'INVOKE_DEFAULT'`, which a file browser needs.
+
+    **The undo step is pushed here.** An operator called from Python pushes
+    none of its own (`WM_operator_call_py` raises `op_undo_depth`): adding a
+    layer from these panels was never a step, and Ctrl+Z after it went back
+    past whatever came before it too. Pushing it here rather than asking
+    Blender to is what lets `history.guard_images` run first.
     """
+    from . import history
+
     try:
-        operator(*args, **kwargs)
+        result = operator(*args, **kwargs)
     except RuntimeError as error:
         print(f"[PaintR2] {description} failed: {error}")
+        session.tag_redraw()
+        return
+    if 'FINISHED' in result:
+        options, label = _undo_options(operator)
+        if 'UNDO' in options:
+            history.push_memfile(label)
     session.tag_redraw()
+
+
+def _undo_options(operator):
+    """(bl_options, label) of the operator behind a `bpy.ops` call."""
+    try:
+        options = set(operator.bl_options)
+        label = operator.get_rna_type().name or operator.idname()
+    except (AttributeError, RuntimeError):
+        return set(), ""
+    return options, label
 
 
 def _add_layer(layer_type):
@@ -4875,24 +4941,6 @@ def _set_panel_width(side, width):
         setattr(ui_state, key, int(width))
 
 
-def _fill_undo(redo=False):
-    """Undo, or redo, the last fill. True when there was one.
-
-    The answer matters: the interface only takes Ctrl+Z when we have a fill
-    to undo, and passes it to Blender otherwise.
-    """
-    from . import history
-
-    if not (history.depth()[1 if redo else 0]):
-        return False
-
-    try:
-        result = bpy.ops.paintr2.fill_undo(redo=redo)
-    except RuntimeError:
-        return False
-    return result == {'FINISHED'}
-
-
 def _bake_mask():
     """Freeze the active layer's pattern into its mask image."""
     _run("bake mask", bpy.ops.paintr2.mask_procedural_bake)
@@ -4926,6 +4974,7 @@ def _effect_property(layer_index, effect_index, on_mask, key, value):
     stack = document.layers[layer_index].effect_stack(on_mask)
     if 0 <= effect_index < len(stack):
         setattr(stack[effect_index], key, value)
+        _mark_edit("Effect Property")
 
 
 def _effect_blend(layer_index, effect_index, on_mask, value):
@@ -5085,6 +5134,7 @@ def _set_blend(index, identifier):
     holder = layer if channel == 'BASE_COLOR' else layer.channel(channel)
     if holder.blend_mode != identifier:
         holder.blend_mode = identifier  # update hook recompiles
+        _mark_edit("Layer Blend")
         session.tag_redraw()
 
 
@@ -5095,6 +5145,7 @@ def _set_opacity(index, value):
     channel = _view_channel()
     holder = layer if channel == 'BASE_COLOR' else layer.channel(channel)
     holder.opacity = value
+    _mark_edit("Layer Opacity")
     session.tag_redraw()
 
 
@@ -5137,6 +5188,7 @@ def _set_fill_color(index, color):
     layer = _layer_at(index)
     if layer is not None and layer.layer_type == 'FILL':
         layer.channel('BASE_COLOR').color = color  # update hook recompiles
+        _mark_edit("Fill Colour")
         session.tag_redraw()
 
 
@@ -5956,7 +6008,6 @@ def _make_root():
     root.on_effect_remove = _effect_remove
     root.on_effect_move = _effect_move
     root.on_mask_bake = _bake_mask
-    root.on_fill_undo = _fill_undo
     root.on_panel_width = _set_panel_width
     root.on_layer_move = _move_layer
     root.on_layer_edit_nodes = _edit_layer_nodes
@@ -6023,15 +6074,11 @@ def close(window_already_gone=False):
     """Tear the session down. Safe to call when nothing is open."""
     global _external_signature, _wireframe_is_ours
 
-    from . import history
-
     _external_signature = None
     _hide_asked.clear()
-    # The fill history goes with the session: its steps are rectangles of
-    # pixels, and anything else in Blender may have rewritten those while the
-    # window was shut. There is no way to notice that from here, so the safe
-    # answer is to forget them.
-    history.clear()
+    # The pixel history is not cleared here. Its steps are steps of Blender's
+    # own undo now, and Ctrl+Z after the window closes still walks
+    # back through them; only a new file ends them.
     # Nothing is left waiting for a timer that is about to have no window to
     # run in -- and the flush is inside `set_deferred`.
     nodegen.set_deferred(False)

@@ -299,7 +299,7 @@ class PAINTR2_OT_bake_mesh_maps_external(bpy.types.Operator):
         from .. import external as ext
 
         while self._queue:
-            material, obj, high = self._queue.pop(0)
+            material, obj, high, tile = self._queue.pop(0)
             if material != self._material:
                 self._flush()
                 self._material = material
@@ -329,13 +329,15 @@ class PAINTR2_OT_bake_mesh_maps_external(bpy.types.Operator):
                 path = ext.prepare(
                     obj, high, self._directory, int(props.mesh_map_resolution),
                     props.mesh_map_samples, wanted, options,
-                    occluders=occluders(context, obj), material=material)
+                    occluders=occluders(context, obj), material=material,
+                    tile=tile)
             except Exception as error:  # noqa: BLE001
                 _note(self._skipped, f"{obj.name}: {error}")
                 _note(self._dropped, obj.name)
                 continue
 
             self._current = obj
+            self._tile = tile
             try:
                 self._job = ext.Job(ext.available(), path, path[:-5] + ".pr2m")
             except OSError as error:
@@ -364,6 +366,7 @@ class PAINTR2_OT_bake_mesh_maps_external(bpy.types.Operator):
         self._queue = [entry for entry in self._queue if entry[0] != material]
         self._pending = {}
         self._done += 1 + len(rest)
+        self._models.update(model.name for model in self._groups.get(material, []))
 
         props = context.scene.paintr2
         wanted = [identifier for identifier in meshmaps.MAP_IDS
@@ -401,6 +404,8 @@ class PAINTR2_OT_bake_mesh_maps_external(bpy.types.Operator):
         self._material = None
         self._pending = {}
         self._current = None
+        self._tile = None
+        self._models = set()
         self._unstartable = ""
         self._with_cycles = 0
         self._groups = {}
@@ -422,8 +427,24 @@ class PAINTR2_OT_bake_mesh_maps_external(bpy.types.Operator):
                         _note(self._dropped, obj.name)
                         continue
                     high = partner.object
-                self._queue.append((material, obj, high))
+                # A UDIM material is one run per tile the model has faces on:
+                # the baker rasterises 0..1 and nothing else.
+                for tile in self._tiles(material, obj):
+                    self._queue.append((material, obj, high, tile))
         self._total = len(self._queue)
+
+    @staticmethod
+    def _tiles(material, obj):
+        """The UDIM tiles `obj` covers with `material`, or [None] if plain."""
+        from .. import udim
+
+        if udim.tiles_for(material) is None:
+            return [None]
+        tiles = set()
+        for index, slot in enumerate(obj.material_slots):
+            if slot.material == material:
+                tiles.update(udim.object_tiles(obj, index)[0])
+        return sorted(tiles)
 
     def execute(self, context):
         # Called when something runs the operator without a window -- a script,
@@ -487,11 +508,13 @@ class PAINTR2_OT_bake_mesh_maps_external(bpy.types.Operator):
 
         produced = ext.read_output(self._job.output_path)
         for identifier, pixels in produced.items():
-            base = self._pending.get(identifier)
+            tiles = self._pending.setdefault(identifier, {})
+            base = tiles.get(self._tile)
             if base is None or base.shape != pixels.shape:
-                self._pending[identifier] = pixels
+                tiles[self._tile] = pixels
             else:
                 meshmaps.merge_coverage(base, pixels)
+        self._models.add(self._current.name)
         self._job.cleanup()
 
     def _run_blocking(self, context):
@@ -525,7 +548,7 @@ class PAINTR2_OT_bake_mesh_maps_external(bpy.types.Operator):
         """The closing report as (kind, message)."""
         where = self._job.device if self._job else ""
         note = (f"Baked {self._maps} map(s) for {self._materials} material(s), "
-                f"{self._done} model(s)")
+                f"{len(self._models)} model(s)")
         if where:
             note += f" on {where}"
         if self._unstartable:

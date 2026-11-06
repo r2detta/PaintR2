@@ -310,10 +310,9 @@ class FillStroke:
     def finish(self):
         """Close the stroke off. One undo step for the whole sweep.
 
-        The step goes into PaintR2's own ring, not Blender's. `ed.undo_push`
-        used to be here and was worse than nothing: a memfile undo step does
-        not carry image pixels, so pressing Ctrl+Z after a fill stepped past
-        the fill without undoing it. See history.py.
+        A step of Blender's own undo, made by history.py. A plain
+        `ed.undo_push` is not enough: a memfile step does not carry pixels,
+        so Ctrl+Z after a fill stepped past it without undoing it.
         """
         if not self.touched:
             return
@@ -358,31 +357,4 @@ class PAINTR2_OT_fill(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class PAINTR2_OT_fill_undo(bpy.types.Operator):
-    """Undo the last fill"""
-
-    bl_idname = "paintr2.fill_undo"
-    bl_label = "Undo Fill"
-    bl_options = {'INTERNAL'}
-
-    redo: bpy.props.BoolProperty(default=False)
-
-    @classmethod
-    def poll(cls, context):
-        from .. import history
-
-        undo_steps, redo_steps = history.depth()
-        return bool(undo_steps or redo_steps)
-
-    def execute(self, context):
-        from .. import history
-
-        done = history.redo() if self.redo else history.undo()
-        if not done:
-            return {'CANCELLED'}
-
-        session.tag_redraw()
-        return {'FINISHED'}
-
-
-CLASSES = (PAINTR2_OT_fill, PAINTR2_OT_fill_undo)
+CLASSES = (PAINTR2_OT_fill,)

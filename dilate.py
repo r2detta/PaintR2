@@ -60,14 +60,28 @@ def fill(image, coverage=None, opaque=True):
 
     Returns True if anything was written. False means there was nothing to
     fill, or nothing to fill *from*.
+
+    A UDIM image is filled tile by tile, each from its own islands: a tile is
+    a texture of its own once exported, and colour from the next one has no
+    business in it. `coverage` is then a {tile: mask} dict.
     """
-    width, height = image.size
+    from . import udim
+
+    written = False
+    for tile in udim.tiles_of(image):
+        mask = coverage.get(tile) if isinstance(coverage, dict) else coverage
+        written |= _fill_tile(image, tile, mask, opaque)
+    return written
+
+
+def _fill_tile(image, tile, coverage, opaque):
+    from . import udim
+
+    width, height = udim.tile_size(image, tile)
     if width < 1 or height < 1:
         return False
 
-    flat = np.empty(width * height * 4, dtype=np.float32)
-    image.pixels.foreach_get(flat)
-    pixels = flat.reshape(height, width, 4)
+    pixels = udim.read(image, tile)
 
     if coverage is None:
         mask = pixels[:, :, 3] > 0.5
@@ -90,8 +104,7 @@ def fill(image, coverage=None, opaque=True):
     elif mask.all():
         return False
 
-    image.pixels.foreach_set(pixels.reshape(-1))
-    image.update()
+    udim.write(image, tile, pixels)
     return True
 
 
@@ -208,5 +221,8 @@ def blank(image):
     Blanking costs one array write per bake, which against a Cycles bake is
     not a cost at all.
     """
-    width, height = image.size
-    image.pixels.foreach_set(np.zeros(width * height * 4, dtype=np.float32))
+    from . import udim
+
+    for tile in udim.tiles_of(image):
+        width, height = udim.tile_size(image, tile)
+        udim.write(image, tile, np.zeros((height, width, 4), dtype=np.float32))

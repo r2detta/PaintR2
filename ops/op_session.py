@@ -31,6 +31,14 @@ class PAINTR2_OT_open(bpy.types.Operator):
             # Stale state from a window that vanished; clear it and retry.
             window_mod.close(window_already_gone=True)
 
+        # UVs edited while the window was shut may have reached a new UDIM tile.
+        from .. import paintset, prepare
+
+        for obj in paintset.paint_objects():
+            for slot in obj.material_slots:
+                if slot.material is not None:
+                    prepare.extend_tiles(slot.material)
+
         # Only the first step happens here: the window switches workspace on
         # the next pass of the event loop, and the interface is started from
         # there. A failure after this point is reported by that step.

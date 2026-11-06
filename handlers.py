@@ -14,6 +14,7 @@ forgets the session; Blender rebuilds the window layout on its own.
 import bpy
 from bpy.app.handlers import persistent
 
+from . import history
 from . import isolation
 from . import session
 from . import storage
@@ -35,6 +36,9 @@ def _on_load_pre(*_args):
 
 @persistent
 def _on_load_post(*_args):
+    # Another file, another undo stack: no step of the old one can come back.
+    history.clear()
+
     # A file that was saved with a session open must not claim to still have
     # one; the window is gone either way.
     scene = getattr(bpy.context, "scene", None)
@@ -93,9 +97,11 @@ def register():
     for handler_list, function in _HANDLERS:
         if function not in handler_list:
             handler_list.append(function)
+    history.register()
 
 
 def unregister():
     for handler_list, function in _HANDLERS:
         if function in handler_list:
             handler_list.remove(function)
+    history.unregister()

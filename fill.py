@@ -936,12 +936,25 @@ class Target:
     every mouse-move during a drag fill is the difference between a tool that
     keeps up and one that stutters. Reading once and writing per step halves
     it; nothing smaller is available, because `pixels` has no partial upload.
+
+    A UDIM image is a Target with a Target per tile under it, made the first
+    time a stroke reaches that tile. A tile the stroke never lands on is never
+    read, and one it has left is not written again, so a fill costs what the
+    tiles it touches cost and not what the whole set would.
     """
 
-    def __init__(self, image):
+    def __init__(self, image, tile=None):
+        from . import udim
+
         self.image = image
-        self.width, self.height = image.size
+        self.tile = tile
+        self.width, self.height = udim.tile_size(image, tile)
         self.pixels = None
+
+        # Tile number -> Target, on the Target of a whole UDIM image only.
+        self.tiled = tile is None and udim.is_tiled(image)
+        self.tiles = {}
+        self.changed = set()
 
         # What this stroke has overwritten so far, for undo: the union of
         # every rectangle it has touched, holding the pixels as they were
@@ -955,17 +968,43 @@ class Target:
     def valid(self):
         return self.width > 0 and self.height > 0
 
+    def tile_target(self, number):
+        """The Target of tile `number`, or None if the image has no such tile."""
+        from . import udim
+
+        if number not in self.tiles:
+            size = udim.tile_size(self.image, number)
+            if size is None or size[0] == 0:
+                return None
+            self.tiles[number] = Target(self.image, number)
+        return self.tiles[number]
+
     def read(self):
+        from . import udim
+
+        if self.tiled:
+            return None  # each tile reads itself when a stroke first reaches it
+
         buffer = np.empty(self.width * self.height * 4, dtype=np.float32)
-        self.image.pixels.foreach_get(buffer)
+        with udim.on_tile(self.image, self.tile) as image:
+            image.pixels.foreach_get(buffer)
         self.pixels = buffer.reshape(self.height, self.width, 4)
         return self.pixels
 
     def write(self):
+        from . import udim
+
+        if self.tiled:
+            for number in self.changed:
+                self.tiles[number].write()
+            self.changed.clear()
+            return
+
         if self.pixels is None:
             return
-        self.image.pixels.foreach_set(self.pixels.reshape(-1))
-        self.image.update()
+        with udim.on_tile(self.image, self.tile) as image:
+            image.pixels.foreach_set(self.pixels.reshape(-1))
+            image.update()
 
     def snapshot(self, bbox):
         """Record `bbox` as it is now, if it is not recorded already.
@@ -1003,14 +1042,41 @@ class Target:
         self.undo_pixels = grown
 
     def commit_undo(self):
-        """Hand this stroke's snapshot to the history ring, and forget it."""
+        """Make this stroke one undo step (history.py), and forget it."""
         from . import history
 
-        if self.undo_pixels is not None:
-            history.push(self.image, self.undo_bbox, self.undo_pixels)
+        targets = self.tiles.values() if self.tiled else (self,)
+        parts = [(target.tile, target.undo_bbox, target.undo_pixels)
+                 for target in targets if target.undo_pixels is not None]
+        history.push_parts(self.image, parts)
 
-        self.undo_bbox = None
-        self.undo_pixels = None
+        for target in targets:
+            target.undo_bbox = None
+            target.undo_pixels = None
+
+
+def _fill_tiles(target, triangles, color, **options):
+    """`fill` on a UDIM image: each tile gets the triangles that sit on it.
+
+    By the triangle's middle, the same rule `rasterize` wraps by. One off the
+    grid, or on a tile this image does not have, has nowhere to land.
+    """
+    from . import udim
+
+    triangles = np.asarray(triangles, dtype=np.float64).reshape(-1, 3, 2)
+    middles = np.floor(triangles.mean(axis=1)).astype(np.int32)
+    numbers = udim.tile_numbers(middles[:, 0], middles[:, 1])
+
+    changed = False
+    for number in np.unique(numbers[numbers > 0]):
+        number = int(number)
+        tile = target.tile_target(number)
+        if tile is None:
+            continue
+        if fill(tile, triangles[numbers == number], color, **options):
+            target.changed.add(number)
+            changed = True
+    return changed
 
 
 def fill(target, triangles, color, strength=1.0, mode='MIX', samples=2,
@@ -1027,6 +1093,12 @@ def fill(target, triangles, color, strength=1.0, mode='MIX', samples=2,
     """
     if not target.valid or len(triangles) == 0:
         return False
+
+    if target.tiled:
+        return _fill_tiles(
+            target, triangles, color, strength=strength, mode=mode,
+            samples=samples, bleed=bleed, conservative=conservative,
+        )
 
     if target.pixels is None:
         target.read()
